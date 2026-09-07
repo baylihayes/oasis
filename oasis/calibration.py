@@ -119,7 +119,7 @@ def _compute_r200m_and_v200m(
 
     # Compute cumulative mass profile
     if isinstance(particle_mass, numpy.ndarray):
-        mass_profile = numpy.cumulative_sum(particle_mass[argsort])
+        mass_profile = numpy.cumsum(particle_mass[argsort])
     else:
         n_particles = len(sorted_distances)
         mass_profile = particle_mass * numpy.arange(1, n_particles + 1)
@@ -163,6 +163,7 @@ def _get_candidate_seed_particle_data(
     load_path: str,
     particle_type: str,
     mass_density: float,
+    redshift: float,
 ) -> numpy.ndarray:
     """
     Extract and process particle data for all seeds within a single mini-box.
@@ -286,9 +287,10 @@ def _get_candidate_seed_particle_data(
         mask_close = numpy.prod(
             numpy.abs(relative_position) <= r_max, axis=1, dtype=bool)
 
-        # Apply mask
+        # Apply mask. Particle velocity is stored as v_phys / sqrt(a), so the conversion is made before
+        # finding the difference between the particle velocity and the seed velocity. 
         relative_position = relative_position[mask_close]
-        relative_velocity = velocity_particles[mask_close] - velocity_seed_i
+        relative_velocity = velocity_particles[mask_close] / numpy.sqrt(1 + redshift) - velocity_seed_i
         mass_particles = mass_particles[mask_close] if \
             isinstance(mass_particles, numpy.ndarray) else mass_particles
 
@@ -581,6 +583,7 @@ def _select_candidate_seeds(
     load_path: str,
     particle_type: str,
     mass_density: float,
+    redshift: float,
     isolation_factor: float = 0.2,
     isolation_radius_factor: float = 2.0,
     n_threads: Optional[int] = None,
@@ -751,7 +754,7 @@ def _select_candidate_seeds(
     # Set up multiprocessing
     processing_args = [
         (minibox_id, position_group, velocity_group, r_max, boxsize, minisize,
-         load_path, particle_type, mass_density)
+         load_path, particle_type, mass_density, redshift)
         for minibox_id, (position_group, velocity_group) in minibox_groups.items()
     ]
 
@@ -1104,6 +1107,7 @@ def get_calibration_data(
             load_path=save_path,
             particle_type=particle_type,
             mass_density=mass_density,
+            redshift = redshift,
             isolation_factor=isolation_factor,
             isolation_radius_factor=isolation_radius_factor,
             n_threads=n_threads,
@@ -1113,9 +1117,10 @@ def get_calibration_data(
         radial_velocity = results[:, 1]
         log_velocity_squared = results[:, 2]
 
+        # Introducing a factor of a from converting v200^2 (more specifically R200) from comoving to physical
         if redshift > 0.:
             a = 1 / (1 + redshift)
-            log_velocity_squared += numpy.log(a**2)
+            log_velocity_squared += numpy.log(a)
 
         with h5py.File(file_name, 'w') as hdf:
             hdf.create_dataset('r', data=radius)
@@ -2790,12 +2795,16 @@ def calibrate(
             raise ValueError("Omega_m out of bounds.")
         
         # Positive radial velocity
-        slope_pos = -2.17603504 + 1.03114681 * (omega_m - 0.3)
-        b_pivot_pos = 1.83532578
+        # slope_pos = -2.17603504 + 1.03114681 * (omega_m - 0.3)
+        # b_pivot_pos = 1.83532578
+
+        # slope_pos = -2.174666 + 1.435353 * (omega_m - 0.3)
+        slope_pos = -1.9029634573662748 + 0.4347721236533314 * numpy.log(omega_m / 0.5)
+        b_pivot_pos = 1.808536
 
         # Negative radial velocity
         slope_neg = slope_pos
-        b_pivot_neg = 0.67985487
+        b_pivot_neg = 0.665695
         
         # Low radius correction
         x0 = 0.5

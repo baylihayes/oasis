@@ -33,6 +33,7 @@ class MiniBoxClassifier:
         run_name: str,
         particle_type: str,
         seed_prop_names: tuple[str],
+        redshift: float,
         padding: float = 5.0,
         fast_mass: bool = False,
         disable_tqdm: bool = True,
@@ -47,6 +48,7 @@ class MiniBoxClassifier:
         self.particle_type = particle_type
         self.padding = padding
         self.seed_prop_names = seed_prop_names
+        self.redshift = redshift
         self.fast_mass = fast_mass
         self.disable_tqdm = disable_tqdm
 
@@ -217,6 +219,10 @@ class MiniBoxClassifier:
             self.particle_type,
             self.padding,
         )
+
+        # Converting particle velocity from v_sim to v_phys
+        a = 1.0 / (1.0 + self.redshift)
+        self.vel_part *= numpy.sqrt(a)
         self.position_tree = cKDTree(self.pos_part, boxsize=self.boxsize)
 
     def _load_calibration_parameters(self):
@@ -263,6 +269,7 @@ class MiniBoxClassifier:
     def _classify(
         rel_pos: numpy.ndarray,
         rel_vel: numpy.ndarray,
+        redshift: float,
         r200: float,
         m200: float,
         class_pars: list | tuple | numpy.ndarray,
@@ -284,6 +291,8 @@ class MiniBoxClassifier:
         rel_vel : numpy.ndarray
             Relative velocities of particles with respect to the halo center,
             shape (N, 3). Each row contains (vx, vy, vz) velocity components.
+        redshift : float
+            Redshift of the simulation. 
         r200 : float
             Overdensity radius of the halo (R200), defining the boundary where 
             the mean enclosed density is 200 times the critical density.
@@ -323,6 +332,7 @@ class MiniBoxClassifier:
         --------
         >>> rel_pos = np.array([[0.1, 0.2, 0.3], [0.5, 0.6, 0.7]])
         >>> rel_vel = np.array([[-1.0, 0.5, 0.2], [0.8, -0.3, 0.1]])
+        >>> redshift = 0.0
         >>> r200 = 1.0
         >>> m200 = 1e12
         >>> pars = [1.5, 0.2, 1.0, 0.1, 2.0, 1.0, 0.5]
@@ -331,11 +341,18 @@ class MiniBoxClassifier:
         [True False]
         """
         m_pos, b_pos, m_neg, b_neg, alpha, beta, gamma = class_pars
-        # Compute V200
-        v200 = G_GRAVITY * m200 / r200
+
+        #Compute comoving v200^2 if r200 is comoving
+        v200_sq = G_GRAVITY * m200 / r200
+
+        a = 1 / (1 + redshift)
+
+        # switching to physical units, r200_phys = a * r200
+        # rel_vel is in physical units already
+        v200phys_sq = v200_sq / a
 
         # Compute the radius to seed_i in r200 units, and ln(v^2) in v200 units
-        part_ln_vel = numpy.log(numpy.sum(numpy.square(rel_vel), axis=1) / v200)
+        part_ln_vel = numpy.log(numpy.sum(numpy.square(rel_vel), axis=1) / v200phys_sq)
         part_radius = numpy.sqrt(numpy.sum(numpy.square(rel_pos), axis=1)) / r200
 
         # Create a mask for particles with positive radial velocity
@@ -417,10 +434,13 @@ class MiniBoxClassifier:
         # Relative coordinates of particles w.r.t seed position
         rel_pos = relative_coordinates(self.pos_part[within_r200b], 
                                        self.pos_seed[i], self.boxsize)
+
+        # Relative velocity of particles w.r.t seed peculiar velocity 
+        # in physical units.
         rel_vel = self.vel_part[within_r200b] - self.vel_seed[i]
 
         # Classify particles around the seed.
-        orb_mask = self._classify(rel_pos, rel_vel, self.r200b[i], self.m200b[i],
+        orb_mask = self._classify(rel_pos, rel_vel, self.redshift,self.r200b[i], self.m200b[i],
         self.pars)
         
         # Ignore seed if it does not have the minimum mass to be considered a
@@ -540,11 +560,14 @@ class MiniBoxClassifier:
                 ))
             r_ball = numpy.min([r_ball[0], r200b_near[j]])
 
+            a = 1 / (1 + self.redshift)
             # Defines the search velocity  of the 6D ball.
+            # Is also converted to physical units
             v_ball_sq = 2**2 * G_GRAVITY * m200b_near[j] / r200b_near[j]
+            v_ball_sq_phys = v_ball_sq / a
 
             # Check the fraction of orbiting particles in the 6D ball
-            ball6d = (rp_sq <= r_ball**2) & (vp_sq <= v_ball_sq)
+            ball6d = (rp_sq <= r_ball**2) & (vp_sq <= v_ball_sq_phys)
             # Compare to the original orbiting population.
             frac_inside = (ball6d * orb_mask_new).sum() / ball6d.sum()
 
@@ -782,7 +805,7 @@ class MiniBoxClassifier:
             
             - self.haloes_perc : pandas.DataFrame or None
                 Final percolated halo catalog containing only halos within the
-                current mini-box. Returns None if no halos remain after percolation.
+                current mini-box. Returns None if no halos remain after.
             - self.orb_pid_perc : numpy.ndarray
                 Percolated array of particle IDs with unique assignments.
             - self.orb_hid_perc : numpy.ndarray
@@ -1100,6 +1123,7 @@ def process_all_miniboxes(
     minisize: float,
     padding: float,
     particle_type: str,
+    redshift: float,
     seed_prop_names: tuple[str],
     fast_mass: bool = False,
     n_threads: int = None,
@@ -1130,6 +1154,8 @@ def process_all_miniboxes(
         halos near boundaries are properly captured.
     particle_type : str
         Type of particles to load (e.g., 'dm' for dark matter, 'gas').
+    redshift : float
+        Redshift of simulation.
     seed_prop_names : Tuple[str], optional
         Tuple with three strings: mass, radius, and scale radius label names in 
         the mini-box HDF5 files, in case other names (e.g. Mvir, Rvir) were used. 
@@ -1172,6 +1198,7 @@ def process_all_miniboxes(
     ...     minisize=25.0,
     ...     padding=5.0,
     ...     particle_type='dm',
+    ...     redshift=0.0,
     ...     seed_prop_names=('mvir', 'rvir', 'rs')
     ...     n_threads=8
     ... )
@@ -1203,7 +1230,8 @@ def process_all_miniboxes(
         minisize=minisize, 
         load_path=load_path,
         run_name=run_name, 
-        particle_type=particle_type, 
+        particle_type=particle_type,
+        redshift=redshift, 
         seed_prop_names=seed_prop_names,
         padding=padding, 
         fast_mass=fast_mass, 
@@ -1399,6 +1427,7 @@ def run_orbiting_mass_assignment(
     minisize: float,
     padding: float,
     particle_type: str,
+    redshift: float,
     seed_prop_names: tuple[str] = ('M200b', 'R200b', 'Rs'),
     fast_mass: bool = False,
     n_threads: int = None,
@@ -1436,6 +1465,8 @@ def run_orbiting_mass_assignment(
     particle_type : str
         Type of particles to process. Common values: 'dm' (dark matter),
         'gas', 'stars'.
+    redshift : float,
+        Redshift of simulation.
     seed_prop_names : Tuple[str], optional
         Tuple with three strings: mass, radius, and scale radius label names in 
         the mini-box HDF5 files, in case other names (e.g. Mvir, Rvir) were used. 
@@ -1502,6 +1533,7 @@ def run_orbiting_mass_assignment(
     ...     minisize=25.0,
     ...     padding=5.0,
     ...     particle_type='dm',
+    ...     redshift=0.0,
     ...     fast_mass=True,
     ...     seed_prop_names=('mvir', 'rvir', 'rs')
     ...     n_threads=16,
@@ -1522,6 +1554,7 @@ def run_orbiting_mass_assignment(
         minisize=minisize,
         padding=padding,
         particle_type=particle_type,
+        redshift = redshift,
         seed_prop_names=seed_prop_names,
         fast_mass=fast_mass,
         n_threads=n_threads,
@@ -1537,6 +1570,7 @@ def run_orbiting_mass_assignment(
         for item in os.listdir(catalogues_path):
             os.remove(catalogues_path + item)
         os.removedirs(catalogues_path)
+        print("Catalogues Cleaned Up")
     if cleanup == 'all':
         n_cells = int(numpy.ceil(boxsize / minisize))
         mini_boxes_path = load_path + f'mini_boxes_nside_{n_cells}/'
