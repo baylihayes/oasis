@@ -17,7 +17,8 @@ from oasis.common import (G_GRAVITY, _validate_boxsize_minisize,
                           _validate_mini_box_id, _validate_positive_number,
                           _validate_positive_number_non_zero,
                           _validate_seed_data)
-from oasis.coordinates import relative_coordinates, velocity_components
+from oasis.coordinates import (_periodic_displacement, relative_coordinates,
+                               velocity_components)
 from oasis.minibox import get_mini_box_id, load_particles
 
 __all__ = [
@@ -278,20 +279,37 @@ def _get_candidate_seed_particle_data(
     position_particles, velocity_particles, _, mass_particles = \
         load_particles(mini_box_id, boxsize, minisize, load_path, particle_type)
 
+    # Periodic KD-tree over the particles, built once per mini-box. Candidates
+    # are searched with a slightly larger radius, then the same cubic mask as
+    # before is applied to them, so the selected particles (and their order)
+    # are identical to masking all particles.
+    position_tree = cKDTree(
+        numpy.mod(position_particles.astype(numpy.float64), boxsize),
+        boxsize=boxsize,
+    )
+    search_margin = 1e-5 * boxsize
+
     # Iterate over seeds in current mini-box.
     radius, radial_velocity, log_velocity_squared = ([] for _ in range(3))
     for position_seed_i, velocity_seed_i in zip(position_seeds, velocity_seeds):
         # Find particles within r_max of the seed
-        relative_position = relative_coordinates(
-            position_particles, position_seed_i, boxsize)
-        mask_close = numpy.prod(
-            numpy.abs(relative_position) <= r_max, axis=1, dtype=bool)
+        candidates = numpy.sort(numpy.asarray(
+            position_tree.query_ball_point(position_seed_i, r_max + search_margin,
+                                           p=numpy.inf),
+            dtype=numpy.intp,
+        ))
+        relative_position = _periodic_displacement(
+            position_particles[candidates], position_seed_i, boxsize)
+        mask_close = numpy.all(numpy.abs(relative_position) <= r_max, axis=1)
+        idx_close = candidates[mask_close]
 
         # Apply mask. Particle velocity is stored as v_phys / sqrt(a), so the conversion is made before
         # finding the difference between the particle velocity and the seed velocity. 
         relative_position = relative_position[mask_close]
-        relative_velocity = velocity_particles[mask_close] / numpy.sqrt(1 + redshift) - velocity_seed_i
-        mass_particles = mass_particles[mask_close] if \
+        relative_velocity = velocity_particles[idx_close] / numpy.sqrt(1 + redshift) - velocity_seed_i
+        # Use a per-seed name so the full particle mass array is not
+        # overwritten by the masked one for the next seed.
+        mass_close = mass_particles[idx_close] if \
             isinstance(mass_particles, numpy.ndarray) else mass_particles
 
         # Compute radial distance (L2 norm). No need to further filter by r_max
@@ -302,7 +320,7 @@ def _get_candidate_seed_particle_data(
         vrp, _, v2p = velocity_components(relative_position, relative_velocity)
 
         # Compute R200m and M200m
-        r200m, v200m_sq = _compute_r200m_and_v200m(rps, mass_particles, mass_density)
+        r200m, v200m_sq = _compute_r200m_and_v200m(rps, mass_close, mass_density)
 
         # Append rescaled quantities to containers
         radius.append(rps / r200m)
@@ -320,6 +338,11 @@ def _get_candidate_seed_particle_data(
     log_velocity_squared = numpy.concatenate(log_velocity_squared)
 
     return numpy.vstack([radius, radial_velocity, log_velocity_squared])
+
+
+def _get_candidate_seed_particle_data_star(args: tuple) -> numpy.ndarray:
+    """Unpack arguments for `_get_candidate_seed_particle_data` (for Pool.imap)."""
+    return _get_candidate_seed_particle_data(*args)
 
 
 def _find_isolated_seeds(
@@ -765,10 +788,12 @@ def _select_candidate_seeds(
             with Pool(n_threads) as pool, tqdm(total=n_miniboxes, colour="blue",
                                                desc='Processing candidates',
                                                ncols=100) as pbar:
-                for result in pool.starmap(_get_candidate_seed_particle_data, processing_args):
+                # imap keeps the input order (same output as starmap) but
+                # yields results as they finish, so the progress bar updates.
+                for result in pool.imap(_get_candidate_seed_particle_data_star,
+                                        processing_args):
                     results.append(result)
                     pbar.update()
-                    pbar.refresh()
         except Exception as e:
             print(
                 f"Warning: Parallel processing failed ({e}), falling back to sequential")
@@ -1532,7 +1557,7 @@ def _gradient_minima(
         Center positions of radial bins with shape (n_radial_bins,). Values are
         in units of R200m and span [r_min, r_max].
     counts_gradient_minima : numpy.ndarray
-        Velocity values at gradient minima for each radial bin with shape
+        Kinetic energy values at gradient minima for each radial bin with shape
         (n_radial_bins,). Values are ln(v^2/V200m^2) and identify boundaries in
         velocity space as a function of radius.
 
@@ -1702,14 +1727,19 @@ def _gradient_minima(
     counts_gradient_out = numpy.zeros((n_radial_bins, n_bins))
     counts_gradient_smooth_out = numpy.zeros((n_radial_bins, n_bins))
 
+    # Every radial bin lies inside [r_min, r_max], so only that subset needs to
+    # be scanned for each bin (same selected values, in the same order).
+    radius_in = radius[mask]
+    log_velocity_squared_in = log_velocity_squared[mask]
+
     for i in range(n_radial_bins):
         # Create mask for current r bin
-        radius_mask = (radius > radius_edges[i]) * \
-            (radius < radius_edges[i + 1])
+        radius_mask = (radius_in > radius_edges[i]) * \
+            (radius_in < radius_edges[i + 1])
 
         # Compute histogram of lnv2 values within the r bin and the vr mask
         counts, log_velocity_squared_edges = numpy.histogram(
-            log_velocity_squared[radius_mask], bins=numpy.linspace(*lnvsq_lims, n_bins+1))
+            log_velocity_squared_in[radius_mask], bins=numpy.linspace(*lnvsq_lims, n_bins+1))
 
         # Compute the gradient of the histogram
         counts_gradient = numpy.gradient(

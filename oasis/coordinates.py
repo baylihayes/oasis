@@ -100,6 +100,18 @@ def relative_coordinates(
     return displacement
 
 
+def _periodic_displacement(
+    positions: numpy.ndarray,
+    reference: numpy.ndarray,
+    boxsize: float,
+) -> numpy.ndarray:
+    """Unvalidated version of `relative_coordinates` (periodic=True) for hot
+    loops. Performs exactly the same arithmetic, so results are identical.
+    `positions` must already have shape (N, 3)."""
+    half_box = 0.5 * boxsize
+    return (positions - reference + half_box) % boxsize - half_box
+
+
 def velocity_components(
     positions: numpy.ndarray,
     velocities: numpy.ndarray

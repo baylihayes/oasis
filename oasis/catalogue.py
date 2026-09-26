@@ -11,7 +11,7 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 from oasis.common import G_GRAVITY, ensure_dir_exists
-from oasis.coordinates import relative_coordinates
+from oasis.coordinates import _periodic_displacement
 from oasis.minibox import load_particles, load_seeds
 
 filterwarnings('ignore')
@@ -89,6 +89,11 @@ class MiniBoxClassifier:
             self.padding,
         )
 
+        # Nothing else to do if there are no seeds around this mini-box.
+        if len(self.hid) == 0:
+            self.n_seeds = 0
+            return
+
         if self.fast_mass:
             m200b_mask = self.m200b > (5.0 * numpy.min(self.m200b))
 
@@ -103,9 +108,8 @@ class MiniBoxClassifier:
         self.n_seeds = len(self.hid)
 
     def _early_exit_if_no_seeds(self):
-        if not any(self.hid):
-            return True
-        return False
+        # Test the number of seeds.
+        return self.n_seeds == 0
 
     def _compute_deltac(self):
         """Compute the characteristic density of an NFW profile.
@@ -148,6 +152,21 @@ class MiniBoxClassifier:
 
         c200 = self.r200b / self.rs
         self.deltac = (200./3.) * (c200 ** 3 / (numpy.log(1 + c200) - (c200 / (1 + c200))))
+
+    def _build_seed_tree(self):
+        """Build a periodic KD-tree over the seed positions once per mini-box.
+
+        Used by `_apply_6d_ball` to find candidate neighbouring seeds instead
+        of computing distances to every seed for every halo. Candidate searches
+        use a radius enlarged by `self._search_margin`; the original float32
+        distance cut is then applied to the candidates, so the selected seeds
+        (and particles) are exactly the same as with a brute-force search.
+        """
+        self._search_margin = 1e-5 * self.boxsize
+        self.seed_tree = cKDTree(
+            numpy.mod(self.pos_seed.astype(numpy.float64), self.boxsize),
+            boxsize=self.boxsize,
+        )
 
     @staticmethod
     def _rho_nfw_roots(
@@ -223,7 +242,10 @@ class MiniBoxClassifier:
         # Converting particle velocity from v_sim to v_phys
         a = 1.0 / (1.0 + self.redshift)
         self.vel_part *= numpy.sqrt(a)
-        self.position_tree = cKDTree(self.pos_part, boxsize=self.boxsize)
+        # Sliding-midpoint trees build much faster than median-balanced trees
+        # and return the same query results.
+        self.position_tree = cKDTree(self.pos_part, boxsize=self.boxsize,
+                                     balanced_tree=False, compact_nodes=False)
 
     def _load_calibration_parameters(self):
         with h5py.File(self.load_path + "calibration_pars.hdf5", "r") as hdf:
@@ -255,9 +277,11 @@ class MiniBoxClassifier:
         self.haloes = pandas.DataFrame(columns=col_names)
         self.haloes_perc = pandas.DataFrame(columns=col_names)
 
-        self.orb_hid = []
-        self.orb_pid = []
-        self.orb_mass = []
+        # Members are stored as local indices into the loaded particle/seed
+        # arrays (not IDs) so percolation can use Boolean "seen" arrays.
+        self.orb_sidx = []   # seed indices of orbiting substructures
+        self.orb_pidx = []   # particle indices of orbiting particles
+        self.orb_mass = []   # only filled for variable-mass particles
         self.n_tot_p = 0
         self.n_tot_s = 0
 
@@ -423,17 +447,22 @@ class MiniBoxClassifier:
         _apply_6d_ball : Subsequent processing step to handle substructures.
         """
         # Select all particles around the seed
-        within_r200b = self.position_tree.query_ball_point(self.pos_seed[i], 
-                                                           2.*self.r200b[i],
-                                                           p=numpy.inf,
-                                                           return_sorted=True)
+        # Convert the index list to an array once; indexing with a Python list
+        # converts it again every time it is used.
+        within_r200b = numpy.asarray(
+            self.position_tree.query_ball_point(self.pos_seed[i],
+                                                2.*self.r200b[i],
+                                                p=numpy.inf,
+                                                return_sorted=True),
+            dtype=numpy.intp,
+        )
         # Skip if not enough particles within R200b
         if len(within_r200b) < self.min_num_part:
             return None
-        
+
         # Relative coordinates of particles w.r.t seed position
-        rel_pos = relative_coordinates(self.pos_part[within_r200b], 
-                                       self.pos_seed[i], self.boxsize)
+        rel_pos = _periodic_displacement(self.pos_part[within_r200b],
+                                         self.pos_seed[i], self.boxsize)
 
         # Relative velocity of particles w.r.t seed peculiar velocity 
         # in physical units.
@@ -478,7 +507,8 @@ class MiniBoxClassifier:
         tuple, int, or None
             - If the seed remains a halo with substructures, returns a tuple:
             (orb_mask_new, orb_seeds) where orb_mask_new is the updated boolean
-            mask and orb_seeds is a list of halo IDs classified as substructures.
+            mask and orb_seeds is an array of seed indices (into the local seed
+            arrays) classified as substructures.
             - If no nearby seeds are found, returns 0.
             - If the seed fails to meet minimum particle requirements after
             processing, returns None.
@@ -506,42 +536,51 @@ class MiniBoxClassifier:
         _rho_nfw_roots : Computes NFW profile intersection radius.
         _classify_particles : Initial particle classification step.
         """
-        # Only work with less massive seeds within a 2*R200b sphere.
-        rel_pos = relative_coordinates(self.pos_seed, self.pos_seed[i], 
-                                       self.boxsize)
+        # Only work with less massive seeds within a 2*R200b sphere. Candidate
+        # seeds come from the seed KD-tree (slightly enlarged radius), then the
+        # exact same float32 distance cut as before is applied to them.
         r_max = 2.0 * self.r200b[i]
-        mask_seed = (numpy.sum(numpy.square(rel_pos[i+1:]), axis=1) <= r_max**2) & \
-            (self.parent_id_seed[i+1:] == -1)
+        candidates = numpy.sort(numpy.asarray(
+            self.seed_tree.query_ball_point(self.pos_seed[i],
+                                            r_max + self._search_margin),
+            dtype=numpy.intp,
+        ))
+        candidates = candidates[candidates > i]
+        candidates = candidates[self.parent_id_seed[candidates] == -1]
+        if candidates.size == 0:
+            return 0
+
+        rel_pos = _periodic_displacement(self.pos_seed[candidates],
+                                         self.pos_seed[i], self.boxsize)
+        mask_seed = numpy.sum(numpy.square(rel_pos), axis=1) <= r_max**2
 
         # Skip if not enough seeds within 2*R200b
         n_seeds_near = mask_seed.sum()
         if n_seeds_near <= 0:
             return 0
 
-        # Select seeds in the vicinity
-        rel_pos = rel_pos[i+1:][mask_seed]
-        pos_near = self.pos_seed[i+1:][mask_seed]
-        vel_near = self.vel_seed[i+1:][mask_seed]
-        deltac_near = self.deltac[i+1:][mask_seed]
-        m200b_near = self.m200b[i+1:][mask_seed]
-        r200b_near = self.r200b[i+1:][mask_seed]
-        rs_near = self.rs[i+1:][mask_seed]
-        hid_near = self.hid[i+1:][mask_seed]
+        # Select seeds in the vicinity (ascending index = descending mass)
+        near_idx = candidates[mask_seed]
+        rel_pos = rel_pos[mask_seed]
+        pos_near = self.pos_seed[near_idx]
+        vel_near = self.vel_seed[near_idx]
+        deltac_near = self.deltac[near_idx]
+        r200b_near = self.r200b[near_idx]
+        rs_near = self.rs[near_idx]
+
+        # Defines the search velocity of the 6D ball, converted to physical
+        # units. Same element-wise arithmetic as the per-seed scalar version.
+        a = 1 / (1 + self.redshift)
+        v_ball_sq_phys_near = 2**2 * G_GRAVITY * self.m200b[near_idx] / r200b_near / a
 
         # Loop over other seeds
         j = 0
         is_halo = True
         orb_seeds = []
         orb_mask_new = numpy.copy(orb_mask)
+        n_orb = int(numpy.count_nonzero(orb_mask_new))
 
         while is_halo and (j < n_seeds_near):
-            # Select particles around jth seed.
-            rel_pos_part = relative_coordinates(self.pos_part[within_r200b],
-                                                pos_near[j], self.boxsize)
-            rel_vel_part = self.vel_part[within_r200b] - vel_near[j]
-            rp_sq = numpy.sum(numpy.square(rel_pos_part), axis=1)
-            vp_sq = numpy.sum(numpy.square(rel_vel_part), axis=1)
-
             # Distance from the current seed to the substructure.
             r_ij = numpy.linalg.norm(rel_pos[j])
             
@@ -558,42 +597,87 @@ class MiniBoxClassifier:
                     rs_near[j], 
                     r_ij
                 ))
-            r_ball = numpy.min([r_ball[0], r200b_near[j]])
+            # Kept as a float64 numpy scalar so the comparison against float32
+            # squared distances is done in float64, as before.
+            r_ball = numpy.float64(min(float(r_ball[0]), float(r200b_near[j])))
 
-            a = 1 / (1 + self.redshift)
-            # Defines the search velocity  of the 6D ball.
-            # Is also converted to physical units
-            v_ball_sq = 2**2 * G_GRAVITY * m200b_near[j] / r200b_near[j]
-            v_ball_sq_phys = v_ball_sq / a
+            # Particles (positions into within_r200b) inside the 6D ball.
+            ball6d = self._particles_in_6d_ball(
+                within_r200b, pos_near[j], vel_near[j], r_ball,
+                v_ball_sq_phys_near[j],
+            )
 
-            # Check the fraction of orbiting particles in the 6D ball
-            ball6d = (rp_sq <= r_ball**2) & (vp_sq <= v_ball_sq_phys)
             # Compare to the original orbiting population.
-            frac_inside = (ball6d * orb_mask_new).sum() / ball6d.sum()
+            n_ball = ball6d.size
+            n_in = int(numpy.count_nonzero(orb_mask_new[ball6d]))
+            frac_inside = n_in / n_ball if n_ball > 0 else numpy.nan
 
             # If more than half the particles in the vicinity of the seed are 
             # orbiting, the seed is tagged as orbiting. The seed is infalling 
             # otherwise and all the particles within the box are tagged as 
             # infalling too.
             upper_threshold = 1. - numpy.exp(-(r_ij / r200b_near[j])**2)
-            f_threshold = numpy.max([0.5, upper_threshold])
+            f_threshold = max(0.5, float(upper_threshold))
 
             if frac_inside >= f_threshold:
-                orb_seeds.append(hid_near[j])
+                orb_seeds.append(near_idx[j])
                 orb_mask_new[ball6d] = True
+                n_orb += n_ball - n_in
             else:
                 orb_mask_new[ball6d] = False
+                n_orb -= n_in
 
             # Check wether seed is still a halo.
-            is_halo = orb_mask_new.sum() >= self.min_num_part
+            is_halo = n_orb >= self.min_num_part
 
             # Next item.
             j += 1
 
         if is_halo:
-            return (orb_mask_new, orb_seeds)
+            return (orb_mask_new, numpy.array(orb_seeds, dtype=numpy.intp))
         else:
             return None
+
+    def _particles_in_6d_ball(
+        self,
+        within_r200b: numpy.ndarray,
+        center_pos: numpy.ndarray,
+        center_vel: numpy.ndarray,
+        r_ball: numpy.float64,
+        v_ball_sq: numpy.floating,
+    ) -> numpy.ndarray:
+        """Return positions in `within_r200b` of the particles inside a 6D ball.
+
+        Equivalent to evaluating `(r^2 <= r_ball^2) & (v^2 <= v_ball_sq)` for
+        every particle in `within_r200b` (which must be sorted), but only the
+        particles returned by a spatial query of the particle KD-tree are
+        evaluated. The query radius is enlarged by `self._search_margin` and
+        the original cut is applied afterwards, so the result is identical.
+        """
+        r_ball_sq = r_ball**2
+        if numpy.isnan(r_ball_sq):
+            return numpy.empty(0, dtype=numpy.intp)
+
+        if numpy.isinf(r_ball_sq):
+            loc = numpy.arange(within_r200b.size)
+        else:
+            candidates = numpy.asarray(
+                self.position_tree.query_ball_point(
+                    center_pos, abs(r_ball) + self._search_margin),
+                dtype=numpy.intp,
+            )
+            # Keep only candidates that are also within 2*R200b of the host.
+            loc = numpy.searchsorted(within_r200b, candidates)
+            loc[loc == within_r200b.size] = 0
+            loc = loc[within_r200b[loc] == candidates]
+
+        idx = within_r200b[loc]
+        rel_pos_part = _periodic_displacement(self.pos_part[idx], center_pos,
+                                              self.boxsize)
+        rel_vel_part = self.vel_part[idx] - center_vel
+        rp_sq = numpy.sum(numpy.square(rel_pos_part), axis=1)
+        vp_sq = numpy.sum(numpy.square(rel_vel_part), axis=1)
+        return loc[(rp_sq <= r_ball_sq) & (vp_sq <= v_ball_sq)]
 
     def _classify_single_seed(self, i: int):
         """Execute complete classification scheme for a single seed halo.
@@ -652,7 +736,8 @@ class MiniBoxClassifier:
 
         The method updates several instance attributes:
         - self.parent_id_seed: Tracks hierarchical relationships
-        - self.orb_hid, self.orb_pid, self.orb_mass: Accumulate member data
+        - self.orb_sidx, self.orb_pidx, self.orb_mass: Accumulate member data
+          (seed indices, particle indices, and masses for variable-mass only)
         - self.n_tot_p, self.n_tot_s: Update global counters for indexing
 
         See Also
@@ -672,29 +757,31 @@ class MiniBoxClassifier:
         if result_2 == 0:
             orb_mask_final = orb_mask
             n_subs = 0
-            orb_seeds = []
+            sub_idx = numpy.empty(0, dtype=numpy.intp)
         elif result_2 is None:
             return None
         else:
-            # Un-pack results
-            orb_mask_final, orb_seeds = result_2
+            # Un-pack results. sub_idx are the seed indices of the orbiting
+            # substructures (seed IDs are assumed unique).
+            orb_mask_final, sub_idx = result_2
             
             # Set parent halo ID for seeds (these are no longer free).
-            mask_subs = numpy.isin(self.hid[i+1:], orb_seeds)
-            self.parent_id_seed[i+1:][mask_subs] = self.hid[i]
-            n_subs = mask_subs.sum()
+            self.parent_id_seed[sub_idx] = self.hid[i]
+            n_subs = sub_idx.size
 
         # Compute orbiting mass, and append orbiting objects to global lists
         n_orb = orb_mask_final.sum()
+        orb_idx = within_r200b[orb_mask_final]
         if isinstance(self.mass_part, numpy.ndarray):
-            morb = numpy.sum(self.mass_part[within_r200b][orb_mask_final])
-            self.orb_mass.append(self.mass_part[within_r200b][orb_mask_final])
+            orb_mass = self.mass_part[orb_idx]
+            morb = numpy.sum(orb_mass)
+            self.orb_mass.append(orb_mass)
         else:
+            # Constant particle mass: no per-particle mass array is needed.
             morb = n_orb * self.mass_part
-            self.orb_mass.append(numpy.full(n_orb, self.mass_part))
         
-        self.orb_hid.append(orb_seeds)
-        self.orb_pid.append(self.pid_part[within_r200b][orb_mask_final])
+        self.orb_sidx.append(sub_idx)
+        self.orb_pidx.append(orb_idx)
         
         # Build the row
         row = dict(
@@ -739,12 +826,13 @@ class MiniBoxClassifier:
             
             - self.haloes : pandas.DataFrame
                 Catalog of identified halos sorted by orbiting mass (descending).
-            - self.orb_pid : numpy.ndarray
-                Concatenated array of particle IDs for all orbiting particles.
-            - self.orb_hid : numpy.ndarray
-                Concatenated array of halo IDs for all identified substructures.
+            - self.orb_pidx : numpy.ndarray
+                Concatenated local indices of all orbiting particles.
+            - self.orb_sidx : numpy.ndarray
+                Concatenated local indices of all identified substructures.
             - self.orb_mass : numpy.ndarray
-                Concatenated array of particle masses for all orbiting particles.
+                Concatenated particle masses of all orbiting particles (only
+                for variable-mass particles).
 
         Notes
         -----
@@ -778,10 +866,11 @@ class MiniBoxClassifier:
         # Sort haloes by their orbiting mass
         self.haloes.sort_values(by='Morb', ascending=False, inplace=True, 
                                 ignore_index=True)
-        if len(self.orb_hid) > 0:
-            self.orb_hid = numpy.concatenate(self.orb_hid).astype(self.hid[0].dtype)
-        if len(self.orb_pid) > 0:
-            self.orb_pid = numpy.concatenate(self.orb_pid).astype(self.pid_part[0].dtype)
+        self.orb_sidx = numpy.concatenate(self.orb_sidx) if self.orb_sidx \
+            else numpy.empty(0, dtype=numpy.intp)
+        self.orb_pidx = numpy.concatenate(self.orb_pidx) if self.orb_pidx \
+            else numpy.empty(0, dtype=numpy.intp)
+        if len(self.orb_mass) > 0:
             self.orb_mass = numpy.concatenate(self.orb_mass)
 
     # ==========================================================================
@@ -821,8 +910,8 @@ class MiniBoxClassifier:
         4. Discards halos falling below the minimum particle threshold
         5. Retains only halos with centers inside the mini-box (INMB=True)
 
-        The use of Python sets for tracking seen particles provides O(1) lookup
-        performance, significantly improving efficiency over array-based approaches.
+        Seen particles and substructures are tracked with Boolean arrays over
+        the local particle and seed arrays, so each halo costs O(members).
 
         This step is critical for avoiding double-counting in overlapping halo
         regions and ensuring mass conservation across the catalog.
@@ -832,74 +921,94 @@ class MiniBoxClassifier:
         _process_all_seeds : Generates the initial halo catalog.
         _save_catalogues : Saves the percolated catalog to disk.
         """
-        orb_pid_perc = []
-        orb_hid_perc = []
-        n_tot_perc = 0
-        n_tot_s_perc = 0
+        # Pull columns out of the DataFrame once; pandas scalar access inside
+        # the loop is slow.
+        haloes = self.haloes
+        n_haloes = len(haloes.index)
+        lidx = haloes["LIDX"].to_numpy(dtype=numpy.int64)
+        ridx = haloes["RIDX"].to_numpy(dtype=numpy.int64)
+        slidx = haloes["SLIDX"].to_numpy(dtype=numpy.int64)
+        sridx = haloes["SRIDX"].to_numpy(dtype=numpy.int64)
+        inmb = haloes["INMB"].to_numpy(dtype=bool)
+        variable_mass = isinstance(self.mass_part, numpy.ndarray)
 
-        # Use sets to speed up isin queries
-        orb_pid_seen = set()
-        orb_hid_seen = set()
+        # Boolean "seen" flags over the local particle and seed arrays. These
+        # replace the Python sets of particle and seed IDs.
+        particle_seen = numpy.zeros(len(self.pid_part), dtype=bool)
+        seed_seen = numpy.zeros(self.n_seeds, dtype=bool)
 
-        for i in tqdm(range(len(self.haloes.index)), ncols=100, 
+        rows, morb_perc, norb_perc, nsubs_perc = [], [], [], []
+        orb_pidx_perc, orb_sidx_perc = [], []
+
+        for i in tqdm(range(n_haloes), ncols=100, 
                       desc='Percolating particles', colour='green', 
                       disable=self.disable_tqdm):
 
-            lidx = self.haloes["LIDX"][i]
-            ridx = self.haloes["RIDX"][i]
-            slidx = self.haloes["SLIDX"][i]
-            sridx = self.haloes["SRIDX"][i]
-
-            # Select particles not orbiting anything more massive
-            pid_range = self.orb_pid[lidx:ridx]
-            new_orb = [p for p in pid_range if p not in orb_pid_seen]
-            orb_pid_seen.update(new_orb)
-            n_orb = len(new_orb)
+            # Select particles not orbiting anything more massive. They are
+            # claimed even if this halo is discarded below.
+            pidx_range = self.orb_pidx[lidx[i]:ridx[i]]
+            keep = ~particle_seen[pidx_range]
+            new_pidx = pidx_range[keep]
+            particle_seen[new_pidx] = True
+            n_orb = new_pidx.size
             
             # Skip to next seed if no longer a halo
             if n_orb < self.min_num_part:
                 continue
 
             # Compute final orbiting mass
-            mask = numpy.isin(pid_range, numpy.array(new_orb))
-            morb = numpy.sum(numpy.array(self.orb_mass[lidx:ridx])[mask])
+            if variable_mass:
+                morb = numpy.sum(self.orb_mass[lidx[i]:ridx[i]][keep])
+            else:
+                morb = n_orb * self.mass_part
 
             # Select seeds not orbiting anything more massive.
-            hid_range = self.orb_hid[slidx:sridx]
-            new_orb_s = [h for h in hid_range if h not in orb_hid_seen]
-            orb_hid_seen.update(new_orb_s)
-            n_orb_s = len(new_orb_s)
+            sidx_range = self.orb_sidx[slidx[i]:sridx[i]]
+            new_sidx = sidx_range[~seed_seen[sidx_range]]
+            seed_seen[new_sidx] = True
 
             # Ignore seed if it is not within the current mini-box
-            if not self.haloes["INMB"][i]:
+            if not inmb[i]:
                 continue
 
-            orb_pid_perc.append(new_orb)
-            orb_hid_perc.append(new_orb_s)
+            rows.append(i)
+            morb_perc.append(morb)
+            norb_perc.append(n_orb)
+            nsubs_perc.append(new_sidx.size)
+            orb_pidx_perc.append(new_pidx)
+            orb_sidx_perc.append(new_sidx)
 
-            self.haloes_perc.loc[len(self.haloes_perc.index)] = [
-                self.haloes["Halo_ID"][i],  # Halo_ID
-                self.haloes["pos"][i],      # pos
-                self.haloes["vel"][i],      # vel
-                self.haloes["R200b"][i],    # R200b
-                self.haloes["M200b"][i],    # M200b
-                morb,                       # Morb
-                n_orb,                      # Norb
-                n_tot_perc,                 # LIDX
-                n_tot_perc + n_orb,         # RIDX
-                True,                       # INMB
-                n_orb_s,                    # NSUBS
-                self.haloes["PID"][i],      # PID
-                n_tot_s_perc,               # SLIDx
-                n_tot_s_perc + n_orb_s,     # SRIDX
-            ]
+        # Build the percolated catalogue once.
+        rows = numpy.array(rows, dtype=numpy.int64)
+        norb_perc = numpy.array(norb_perc, dtype=numpy.int64)
+        nsubs_perc = numpy.array(nsubs_perc, dtype=numpy.int64)
+        lidx_perc = numpy.concatenate(([0], numpy.cumsum(norb_perc)[:-1])) \
+            if rows.size else norb_perc
+        slidx_perc = numpy.concatenate(([0], numpy.cumsum(nsubs_perc)[:-1])) \
+            if rows.size else nsubs_perc
 
-            n_tot_perc += n_orb
-            n_tot_s_perc += n_orb_s
+        self.haloes_perc = pandas.DataFrame({
+            "Halo_ID": haloes["Halo_ID"].to_numpy(dtype=numpy.int64)[rows],
+            "pos": haloes["pos"].to_numpy()[rows],
+            "vel": haloes["vel"].to_numpy()[rows],
+            "R200b": haloes["R200b"].to_numpy(dtype=numpy.float64)[rows],
+            "M200b": haloes["M200b"].to_numpy(dtype=numpy.float64)[rows],
+            "Morb": numpy.array(morb_perc, dtype=numpy.float64),
+            "Norb": norb_perc,
+            "LIDX": lidx_perc,
+            "RIDX": lidx_perc + norb_perc,
+            "INMB": numpy.ones(rows.size, dtype=bool),
+            "NSUBS": nsubs_perc,
+            "PID": haloes["PID"].to_numpy(dtype=numpy.int64)[rows],
+            "SLIDX": slidx_perc,
+            "SRIDX": slidx_perc + nsubs_perc,
+        }, columns=self.haloes_perc.columns)
 
-        # Concatenate lists into arrays
-        self.orb_pid_perc = numpy.concatenate(orb_pid_perc) if orb_pid_perc else numpy.array([])
-        self.orb_hid_perc = numpy.concatenate(orb_hid_perc) if orb_hid_perc else numpy.array([])
+        # Concatenate lists into arrays of particle and seed IDs
+        self.orb_pid_perc = self.pid_part[numpy.concatenate(orb_pidx_perc)] \
+            if orb_pidx_perc else numpy.array([])
+        self.orb_hid_perc = self.hid[numpy.concatenate(orb_sidx_perc)] \
+            if orb_sidx_perc else numpy.array([])
 
     # ==========================================================================
     def _save_catalogues(self):
@@ -1051,6 +1160,7 @@ class MiniBoxClassifier:
             return None
         
         self._compute_deltac()
+        self._build_seed_tree()
         self._load_particles()
         self._load_calibration_parameters()
         self._init_catalogue_dataframe()
@@ -1240,11 +1350,16 @@ def process_all_miniboxes(
     
     # Safely handle multiprocessing falure with a fall back to a single thread.
     if n_threads > 1:
+        # Submit the most expensive (most populated) mini-boxes first so a few
+        # dense boxes do not end up running alone at the end of the run. Each
+        # mini-box is independent, so the order does not change the output.
+        box_order = _mini_boxes_by_workload(load_path, boxsize, minisize,
+                                            particle_type, n_mini_boxes)
         try:
             with Pool(n_threads) as pool, \
                 tqdm(total=n_mini_boxes, colour="green", ncols=100,
                     desc='Generating halo catalogue') as pbar:
-                for _ in pool.imap(func, range(n_mini_boxes)):
+                for _ in pool.imap_unordered(func, box_order):
                     pbar.update()
         except RuntimeError as e:
             # Fall back to sequential processing
@@ -1257,6 +1372,31 @@ def process_all_miniboxes(
             func(box_i)
 
     return None
+
+
+def _mini_boxes_by_workload(
+    load_path: str,
+    boxsize: float,
+    minisize: float,
+    particle_type: str,
+    n_mini_boxes: int,
+) -> list[int]:
+    """Return mini-box IDs sorted by number of particles, largest first.
+
+    Only reads dataset shapes, not the data. Boxes whose file cannot be read
+    are placed last.
+    """
+    cells_per_side = int(numpy.ceil(boxsize / minisize))
+    counts = numpy.zeros(n_mini_boxes, dtype=numpy.int64)
+    for box_id in range(n_mini_boxes):
+        file_name = load_path + f'mini_boxes_nside_{cells_per_side}/{box_id}.hdf5'
+        try:
+            with h5py.File(file_name, 'r') as hdf:
+                counts[box_id] = hdf[f'{particle_type}/ID'].shape[0]
+        except (OSError, KeyError):
+            counts[box_id] = -1
+    # Stable sort keeps the natural ID order among equally populated boxes.
+    return numpy.argsort(-counts, kind='stable').tolist()
 
 
 def append_dataset(group: h5py.Group, name: str, data: numpy.ndarray) -> None:
@@ -1328,8 +1468,10 @@ def merge_catalogues(
         - PID: Concatenated particle IDs for all orbiting particles
         - Halo_ID: Concatenated halo IDs for all orbiting substructures
 
-    The function uses chunked, resizable HDF5 datasets to efficiently handle
-    large catalogs without excessive memory consumption.
+    The function makes two passes over the mini-box files: the first reads
+    only dataset shapes, the second copies each file into its slice of
+    preallocated output datasets. Peak memory is one mini-box catalogue.
+    Files are merged in mini-box ID order, so the output order is deterministic.
 
     Missing mini-box files (from boxes with no halos) are automatically
     skipped without error.
@@ -1349,72 +1491,92 @@ def merge_catalogues(
     run_orbiting_mass_assignment : High-level function that calls both.
     """
     save_path = load_path + f'run_{run_name}/mini_box_catalogues/'
-    files = os.listdir(save_path)
 
-    # Find dataset keys from file
-    first_file = None
-    if len(files) > 0:
-        first_file = os.path.join(save_path, files[0])
-        with h5py.File(first_file, 'r') as hdf_load:
-            halo_keys = list((hdf_load['halo'].keys()))
-    else:
+    # Merge in mini-box ID order so the output order is deterministic.
+    def _file_key(name):
+        stem = os.path.splitext(name)[0]
+        return (0, int(stem), name) if stem.isdigit() else (1, 0, name)
+    files = sorted(os.listdir(save_path), key=_file_key)
+
+    if len(files) == 0:
         raise FileNotFoundError("No mini-box catalogue files found.")
-    
-    # Load and concatenate data
-    halo_data = {key: [] for key in halo_keys}
 
-    n_part, n_seed = 0, 0
-    hdf_memb = h5py.File(load_path + f'run_{run_name}/members.hdf5', 'w')
-    
-    for file in tqdm(files, ncols=100, desc='Merging catalogues',
-                     colour='green'):
+    # First pass: only read dataset shapes to find the size of each output
+    # dataset and each file's offsets, so the outputs can be preallocated and
+    # written with one slice per file. Peak memory is one mini-box catalogue.
+    entries = []
+    halo_specs = None
+    pid_dtype, hid_dtype = None, None
+    n_halo_tot, n_part, n_seed = 0, 0, 0
+    for file in files:
         file_path = os.path.join(save_path, file)
         with h5py.File(file_path, 'r') as hdf_load:
             if 'halo' not in hdf_load.keys():
                 continue
-            # Member data ======================================================
-            # Number of particles in current file
+            if halo_specs is None:
+                halo_specs = {key: (ds.dtype, ds.shape[1:])
+                              for key, ds in hdf_load['halo'].items()}
+            n_halo_this = hdf_load['halo/Halo_ID'].shape[0]
             n_part_this = hdf_load['memb/PID'].shape[0]
-            # Number of subhalos in current file
+            if pid_dtype is None:
+                pid_dtype = hdf_load['memb/PID'].dtype
             n_seed_this = 0
-            has_sub_halos = 'Halo_ID' in hdf_load['memb'].keys()
-
-            # Append data
-            append_dataset(hdf_memb, 'PID', hdf_load['memb/PID'][()])
-            if has_sub_halos:
-                append_dataset(hdf_memb, 'Halo_ID', hdf_load['memb/Halo_ID'][()])
+            if 'Halo_ID' in hdf_load['memb'].keys():
                 n_seed_this = hdf_load['memb/Halo_ID'].shape[0]
+                if hid_dtype is None:
+                    hid_dtype = hdf_load['memb/Halo_ID'].dtype
+        entries.append((file_path, n_halo_tot, n_halo_this, n_part, n_part_this,
+                        n_seed, n_seed_this))
+        n_halo_tot += n_halo_this
+        n_part += n_part_this
+        n_seed += n_seed_this
 
-            # Halo data ========================================================
-            for key in halo_keys:
-                data = hdf_load[f"halo/{key}"][()]
-                # Offset indices by number of objects in this file
-                if key in {"LIDX", "RIDX"}:
-                    data += n_part
-                elif key in {"SLIDX", "SRIDX"}:
-                    data += n_seed
-                halo_data[key].append(data)
+    if halo_specs is None:
+        raise FileNotFoundError("No mini-box catalogue files found.")
 
-            # Add the total number of particles in this file to the next.
-            n_part += n_part_this
-            n_seed += n_seed_this
+    # Second pass: copy each file into its slice of the preallocated outputs.
+    with h5py.File(load_path + f'run_{run_name}/members.hdf5', 'w') as hdf_memb, \
+            h5py.File(load_path + f'run_{run_name}/catalogue.hdf5', 'w') as hdf:
+        memb_pid = hdf_memb.create_dataset('PID', shape=(n_part,), dtype=pid_dtype)
+        memb_hid = None
+        if n_seed > 0:
+            memb_hid = hdf_memb.create_dataset('Halo_ID', shape=(n_seed,),
+                                               dtype=hid_dtype)
 
-    hdf_memb.close()
-
-    # Set the seed index to -1 for all those haloes without subhaloes.
-    slidx = numpy.concatenate(halo_data.get("SLIDX", []), dtype=numpy.int32)
-    sridx = numpy.concatenate(halo_data.get("SRIDX", []), dtype=numpy.int32)
-    mask = (sridx-slidx == 0)
-    slidx[mask] = -1
-    sridx[mask] = -1
-
-    with h5py.File(load_path + f'run_{run_name}/catalogue.hdf5', 'w') as hdf:
-        hdf.create_dataset('SLIDX', data=slidx)
-        hdf.create_dataset('SRIDX', data=sridx)
-        for key, chunks in halo_data.items():
+        halo_out = {}
+        for key, (dtype, tail) in halo_specs.items():
             if key in {'SLIDX', 'SRIDX'}:
-                continue
-            hdf.create_dataset(key, data=numpy.concatenate(chunks))
+                dtype = numpy.int32
+            halo_out[key] = hdf.create_dataset(key, shape=(n_halo_tot,) + tail,
+                                               dtype=dtype)
+
+        for (file_path, h0, nh, p0, n_part_this, s0, n_seed_this) in tqdm(
+                entries, ncols=100, desc='Merging catalogues', colour='green'):
+            with h5py.File(file_path, 'r') as hdf_load:
+                # Member data ==================================================
+                memb_pid[p0:p0 + n_part_this] = hdf_load['memb/PID'][()]
+                if n_seed_this > 0:
+                    memb_hid[s0:s0 + n_seed_this] = hdf_load['memb/Halo_ID'][()]
+
+                # Halo data ====================================================
+                for key in halo_specs:
+                    data = hdf_load[f"halo/{key}"][()]
+                    # Offset indices by number of objects in previous files
+                    if key in {"LIDX", "RIDX"}:
+                        data += p0
+                    elif key in {"SLIDX", "SRIDX"}:
+                        data += s0
+                    halo_out[key][h0:h0 + nh] = data
+
+        # Set the seed index to -1 for all those haloes without subhaloes.
+        if 'SLIDX' in halo_out and 'SRIDX' in halo_out:
+            slidx = halo_out['SLIDX'][()]
+            sridx = halo_out['SRIDX'][()]
+            mask = (sridx - slidx == 0)
+            slidx[mask] = -1
+            sridx[mask] = -1
+            halo_out['SLIDX'][()] = slidx
+            halo_out['SRIDX'][()] = sridx
     
     return None
 

@@ -11,7 +11,7 @@ from oasis.common import (TimerContext, _validate_boxsize_minisize,
                           _validate_coordinate_array, _validate_inputs_load,
                           _validate_mini_box_id, _validate_process_objects,
                           ensure_dir_exists, get_min_uint_dtype)
-from oasis.coordinates import relative_coordinates
+from oasis.coordinates import _periodic_displacement
 
 __all__ = [
     'get_mini_box_id',
@@ -378,26 +378,24 @@ def split_simulation_into_mini_boxes(
             upp = min((chunk + 1) * chunksize, n_items)
             mini_box_ids[low:upp] = get_mini_box_id(positions[low:upp], boxsize, minisize)
     
-    # OPTIMIZATION: Sort all arrays by mini-box ID once
-    # This groups all particles in the same mini-box together
+    # Sort the mini-box IDs once. The arrays themselves are not reordered
+    # (that would make a full sorted copy of every array); each mini-box
+    # gathers its rows through its slice of `sort_indices` instead, which
+    # writes exactly the same rows in the same order.
     with TimerContext("Sorting by mini-box ID", fancy=False):
         sort_indices = numpy.argsort(mini_box_ids)
-        mini_box_ids = mini_box_ids[sort_indices]
-        positions = positions[sort_indices]
-        velocities = velocities[sort_indices]
-        uid = uid[sort_indices]
-        
-        if not isinstance(mass, float):
-            mass = mass[sort_indices]
-        
+
         if props:
             data_arrays, data_labels, data_dtypes = props
-            data_arrays = [arr[sort_indices] for arr in data_arrays]
     
-    # Find boundaries of each mini-box in the sorted arrays
-    # This is much faster than using masks
-    unique_ids, start_indices = numpy.unique(mini_box_ids, return_index=True)
-    end_indices = numpy.append(start_indices[1:], n_items)
+    # Find boundaries of each mini-box in the sorted order from the number of
+    # items per mini-box (avoids a second sort inside numpy.unique).
+    counts = numpy.bincount(mini_box_ids, minlength=n_cells)
+    del mini_box_ids
+    unique_ids = numpy.flatnonzero(counts)
+    end_all = numpy.cumsum(counts)
+    start_indices = (end_all - counts)[unique_ids]
+    end_indices = end_all[unique_ids]
     
     n_mini_box_ids = len(unique_ids)
 
@@ -410,10 +408,11 @@ def split_simulation_into_mini_boxes(
         start = start_indices[idx]
         end = end_indices[idx]
         
-        # Direct slicing is much faster than boolean masking
-        pos = positions[start:end]
-        vel = velocities[start:end]
-        ids = uid[start:end]
+        # Rows of this mini-box, in the same order as a full sort would give
+        rows = sort_indices[start:end]
+        pos = positions[rows]
+        vel = velocities[rows]
+        ids = uid[rows]
         
         # Use 'a' mode to append data if file already exists.
         with h5py.File(save_dir + f'{box_id}.hdf5', 'a') as hdf:
@@ -426,12 +425,12 @@ def split_simulation_into_mini_boxes(
                                    data=mass, dtype=numpy.float32)
             else:
                 hdf.create_dataset(name=f'{particle_type}/{mass_label}', 
-                                   data=mass[start:end], dtype=numpy.float32)
+                                   data=mass[rows], dtype=numpy.float32)
 
             if props:
                 for arr_i, label_i, dtype_i in zip(data_arrays, data_labels, data_dtypes):
                     hdf.create_dataset(name=f'{particle_type}/{label_i}', 
-                                    data=arr_i[start:end], dtype=dtype_i)
+                                    data=arr_i[rows], dtype=dtype_i)
 
     if n_threads > 1:
         try:
@@ -549,6 +548,29 @@ def process_simulation_data(
     return None
 
 
+def _unique_in_order(values: numpy.ndarray) -> list:
+    """Return the unique values in order of first appearance."""
+    return list(dict.fromkeys(numpy.asarray(values).tolist()))
+
+
+def _mini_box_center(
+    mini_box_id: Union[int, numpy.integer],
+    cells_per_side: int,
+    minisize: float,
+) -> numpy.ndarray:
+    """Center coordinates of a mini-box. Grid cells start at (0,0,0) with size
+    minisize, using the mapping ID = k + j*cells_per_side + i*cells_per_side²."""
+    i = mini_box_id // (cells_per_side**2)
+    remainder = mini_box_id % (cells_per_side**2)
+    j = remainder // cells_per_side
+    k = remainder % cells_per_side
+    return numpy.array([
+        (k + 0.5) * minisize,
+        (j + 0.5) * minisize,
+        (i + 0.5) * minisize
+    ])
+
+
 def load_particles(
     mini_box_id: Union[int, numpy.integer],
     boxsize: float,
@@ -639,32 +661,45 @@ def load_particles(
     # Input validation
     _validate_inputs_load(mini_box_id, boxsize, minisize, load_path, padding)
 
-    # Get the adjacent mini-box IDs
-    mini_box_ids = get_adjacent_mini_box_ids(
+    # Get the adjacent mini-box IDs. With fewer than 3 cells per side the same
+    # neighbour appears several times; load each mini-box only once.
+    mini_box_ids = _unique_in_order(get_adjacent_mini_box_ids(
         mini_box_id=mini_box_id,
         boxsize=boxsize,
         minisize=minisize
-    )
+    ))
     
     # Determine number of partitions per side
     cells_per_side = int(numpy.ceil(boxsize / minisize))
 
+    # Select particles within a padding distance of the edge of the box in each
+    # direction. The mask is applied to each file as it is read, so only the
+    # selected particles are kept in memory and concatenated.
+    center = _mini_box_center(mini_box_id, cells_per_side, minisize)
+    padded_distance = 0.5 * minisize + padding
+
     # Create empty lists (containers) to save the data from file for each ID
     positions, velocities, ids, masses = ([] for _ in range(4))
+    n_loaded = 0
 
     # Load all adjacent boxes
     try:
-        for i, mini_box in enumerate(mini_box_ids):
+        for mini_box in mini_box_ids:
             file_name = f'mini_boxes_nside_{cells_per_side}/{mini_box}.hdf5'
             with h5py.File(load_path + file_name, 'r') as hdf:
-                positions.append(hdf[f'{particle_type}/pos'][()])
-                velocities.append(hdf[f'{particle_type}/vel'][()])
-                ids.append(hdf[f'{particle_type}/ID'][()])
+                pos_i = hdf[f'{particle_type}/pos'][()]
+                n_loaded += len(pos_i)
+                mask = numpy.all(numpy.abs(_periodic_displacement(
+                    pos_i, center, boxsize)) <= padded_distance, axis=1)
+
+                positions.append(pos_i[mask])
+                velocities.append(hdf[f'{particle_type}/vel'][()][mask])
+                ids.append(hdf[f'{particle_type}/ID'][()][mask])
                 
                 if hdf[f'{particle_type}/mass'].shape == ():
                     masses = hdf[f'{particle_type}/mass'][()]
                 else:
-                    masses.append(hdf[f'{particle_type}/mass'][()])
+                    masses.append(hdf[f'{particle_type}/mass'][()][mask])
 
     except Exception as e:
         print(f'Particle type not valid. {e}')
@@ -676,44 +711,10 @@ def load_particles(
     if isinstance(masses, list):
         masses = numpy.concatenate(masses)
 
-    # Select particles within a padding distance of the edge of the box in each
-    # direction. First determine the coordinates of the minibox center and then
-    # mask particles.
-    
-    # Calculate center coordinates. Grid cells start at (0,0,0) with size
-    # minisize. Convert 1D ID to 3D grid coordinates (i, j, k).
-    # Using the mapping: ID = k + j*cells_per_side + i*cells_per_side²
-    cells_per_side = int(numpy.ceil(boxsize / minisize))
-    i = mini_box_id // (cells_per_side**2)
-    remainder = mini_box_id % (cells_per_side**2)
-    j = remainder // cells_per_side
-    k = remainder % cells_per_side
-
-    center = numpy.array([
-        (k + 0.5) * minisize,
-        (j + 0.5) * minisize,
-        (i + 0.5) * minisize
-    ])
-
-    # Mask particles
-    padded_distance = 0.5 * minisize + padding
-    absolute_rel_pos = numpy.abs(
-        relative_coordinates(positions, center, boxsize, periodic=True)
-    )
-    mask = numpy.prod(absolute_rel_pos <= padded_distance, axis=1, dtype=bool)
-
-    # Final validation
-    n_loaded = len(positions)
+    # Same error as before when the particle datasets are empty (previously
+    # raised by relative_coordinates on the concatenated array).
     if n_loaded == 0:
-        raise RuntimeError(
-            f"No particles found within padding distance {padding} "
-            f"of mini-box {mini_box_id}"
-        )
-    
-    positions = positions[mask]
-    velocities = velocities[mask]
-    ids = ids[mask]
-    masses = masses[mask] if isinstance(masses, numpy.ndarray) else masses
+        raise ValueError("Input positions must contain at least one particle")
 
     return positions, velocities, ids, masses
 
@@ -832,37 +833,45 @@ def load_seeds(
     _validate_inputs_load(mini_box_id, boxsize, minisize, load_path, padding)
     label_m200, label_r200, label_rs = seed_prop_names
 
-    # Get the adjacent mini-box IDs
-    mini_box_ids = get_adjacent_mini_box_ids(
+    # Get the adjacent mini-box IDs. With fewer than 3 cells per side the same
+    # neighbour appears several times; load each mini-box only once.
+    mini_box_ids = _unique_in_order(get_adjacent_mini_box_ids(
         mini_box_id=mini_box_id,
         boxsize=boxsize,
         minisize=minisize
-    )
+    ))
     
     # Determine number of partitions per side
     cells_per_side = int(numpy.ceil(boxsize / minisize))
 
+    # Select seeds within a padding distance of the edge of the box in each
+    # direction. The mask is applied to each file as it is read.
+    center = _mini_box_center(mini_box_id, cells_per_side, minisize)
+    padded_distance = 0.5 * minisize + padding
+
     # Create empty lists (containers) to save the data from file for each ID
     positions, velocities, ids, r200, m200, rs, mini_box_mask = (
         [] for _ in range(7))
+    n_read = 0
     
     # Load all adjacent boxes
-    for i, mini_box in enumerate(mini_box_ids):
+    for mini_box in mini_box_ids:
         file_name = load_path + f'mini_boxes_nside_{cells_per_side}/{mini_box}.hdf5'
         with h5py.File(file_name, 'r') as hdf:
             if not 'seed' in hdf.keys():
                 continue
-            positions.append(hdf['seed/pos'][()])
-            velocities.append(hdf['seed/vel'][()])
-            ids.append(hdf['seed/ID'][()])
-            r200.append(hdf[f'seed/{label_r200}'][()])
-            m200.append(hdf[f'seed/{label_m200}'][()])
-            rs.append(hdf[f'seed/{label_rs}'][()])
-            n_seeds = len(hdf['seed/ID'][()])
-            if mini_box == mini_box_id:
-                mini_box_mask.append(numpy.ones(n_seeds, dtype=bool))
-            else:
-                mini_box_mask.append(numpy.zeros(n_seeds, dtype=bool))
+            pos_i = hdf['seed/pos'][()]
+            n_read += len(pos_i)
+            mask = numpy.all(numpy.abs(_periodic_displacement(
+                pos_i, center, boxsize)) <= padded_distance, axis=1)
+            positions.append(pos_i[mask])
+            velocities.append(hdf['seed/vel'][()][mask])
+            ids.append(hdf['seed/ID'][()][mask])
+            r200.append(hdf[f'seed/{label_r200}'][()][mask])
+            m200.append(hdf[f'seed/{label_m200}'][()][mask])
+            rs.append(hdf[f'seed/{label_rs}'][()][mask])
+            mini_box_mask.append(
+                numpy.full(mask.sum(), mini_box == mini_box_id, dtype=bool))
 
     # Concatenate all loaded data into single arrays
     positions = numpy.concatenate(positions)
@@ -873,39 +882,9 @@ def load_seeds(
     rs = numpy.concatenate(rs)
     mini_box_mask = numpy.concatenate(mini_box_mask)
 
-    # Select seeds within a padding distance of the edge of the box in each
-    # direction. First determine the coordinates of the minibox center and then
-    # mask seeds.
-
-    # Calculate center coordinates. Grid cells start at (0,0,0) with size
-    # minisize. Convert 1D ID to 3D grid coordinates (i, j, k).
-    # Using the mapping: ID = k + j*cells_per_side + i*cells_per_side²
-    i = mini_box_id // (cells_per_side**2)
-    remainder = mini_box_id % (cells_per_side**2)
-    j = remainder // cells_per_side
-    k = remainder % cells_per_side
-
-    center = numpy.array([
-        (k + 0.5) * minisize,
-        (j + 0.5) * minisize,
-        (i + 0.5) * minisize
-    ])
-
-    # Mask seeds
-    padded_distance = 0.5 * minisize + padding
-    absolute_rel_pos = numpy.abs(
-        relative_coordinates(positions, center, boxsize, periodic=True),
-    )
-    mask = numpy.prod(absolute_rel_pos <= padded_distance, axis=1, dtype=bool)
-
-    # Apply mask
-    m200 = m200[mask]
-    r200 = r200[mask]
-    positions = positions[mask]
-    velocities = velocities[mask]
-    ids = ids[mask]
-    rs = rs[mask]
-    mini_box_mask = mini_box_mask[mask]
+    # Same error as before when the seed datasets are empty.
+    if n_read == 0:
+        raise ValueError("Input positions must contain at least one particle")
 
     # Final validation
     n_loaded = len(positions)
