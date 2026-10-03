@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 from oasis.common import G_GRAVITY, ensure_dir_exists
 from oasis.coordinates import _periodic_displacement
-from oasis.minibox import load_particles, load_seeds
+from oasis.datasource import LegacyMiniBoxDataSource, SpatialDataSource
 
 filterwarnings('ignore')
 
@@ -37,6 +37,7 @@ class MiniBoxClassifier:
         padding: float = 5.0,
         fast_mass: bool = False,
         disable_tqdm: bool = True,
+        data_source: SpatialDataSource | None = None,
     ):
         # Input parameters
         self.mini_box_id = mini_box_id
@@ -51,6 +52,21 @@ class MiniBoxClassifier:
         self.redshift = redshift
         self.fast_mass = fast_mass
         self.disable_tqdm = disable_tqdm
+
+        # Where seeds and particles come from. By default, the current minibox
+        # files, so existing scripts behave as before.
+        if data_source is None:
+            data_source = LegacyMiniBoxDataSource(
+                load_path=load_path, boxsize=boxsize, minisize=minisize,
+                particle_type=particle_type, seed_prop_names=seed_prop_names,
+                padding=padding,
+            )
+        if data_source.boxsize != boxsize:
+            raise ValueError(
+                f"data_source.boxsize ({data_source.boxsize}) must equal the"
+                f" global boxsize ({boxsize})"
+            )
+        self.data_source = data_source
 
         # Internal parameters
         self.save_path = None
@@ -72,27 +88,25 @@ class MiniBoxClassifier:
         ensure_dir_exists(self.save_path)
 
     def _load_seeds_and_filter(self):
-        (
-            self.pos_seed,
-            self.vel_seed,
-            self.hid,
-            self.r200b,
-            self.m200b,
-            self.rs,
-            self.mask_mb,
-        ) = load_seeds(
-            self.mini_box_id,
-            self.boxsize,
-            self.minisize,
-            self.load_path,
-            self.seed_prop_names,
-            self.padding,
-        )
+        seeds = self.data_source.load_seeds(self.mini_box_id)
 
         # Nothing else to do if there are no seeds around this mini-box.
-        if len(self.hid) == 0:
+        if len(seeds) == 0:
             self.n_seeds = 0
             return
+
+        # Process seeds in descending M200b order. The stable sort keeps the
+        # order of equal masses exactly as the data source gave them, so it 
+        # changes nothing for the legacy source (already sorted) and is 
+        # deterministic for any other source. 
+        order = numpy.argsort(-seeds.m200b, kind = 'stable')
+        self.pos_seed = seeds.pos[order]
+        self.vel_seed = seeds.vel[order]
+        self.hid = seeds.hid[order]
+        self.r200b = seeds.r200b[order]
+        self.m200b = seeds.m200b[order]
+        self.rs = seeds.rs[order]
+        self.mask_mb = seeds.in_core[order]
 
         if self.fast_mass:
             m200b_mask = self.m200b > (5.0 * numpy.min(self.m200b))
@@ -225,23 +239,16 @@ class MiniBoxClassifier:
         return frac1 - frac2
 
     def _load_particles(self):
-        (
-            self.pos_part,
-            self.vel_part,
-            self.pid_part,
-            self.mass_part,
-        ) = load_particles(
-            self.mini_box_id,
-            self.boxsize,
-            self.minisize,
-            self.load_path,
-            self.particle_type,
-            self.padding,
-        )
+        particles = self.data_source.load_particles(self.mini_box_id)
+        self.pos_part = particles.pos
+        self.vel_part = particles.vel
+        self.pid_part = particles.pid
+        self.mass_part = particles.mass
 
         # Converting particle velocity from v_sim to v_phys
         a = 1.0 / (1.0 + self.redshift)
         self.vel_part *= numpy.sqrt(a)
+
         # Sliding-midpoint trees build much faster than median-balanced trees
         # and return the same query results.
         self.position_tree = cKDTree(self.pos_part, boxsize=self.boxsize,
@@ -1237,6 +1244,7 @@ def process_all_miniboxes(
     seed_prop_names: tuple[str],
     fast_mass: bool = False,
     n_threads: int = None,
+    data_source: SpatialDataSource | None = None,
 ) -> None:
     """Process all mini-boxes in parallel to generate individual halo catalogs.
 
@@ -1323,14 +1331,20 @@ def process_all_miniboxes(
     save_path = load_path + f'run_{run_name}/mini_box_catalogues/'
     ensure_dir_exists(save_path)
 
-    # Number of miniboxes
-    n_mini_boxes = numpy.int_(numpy.ceil(boxsize / minisize))**3
+    if data_source is None:
+        data_source = LegacyMiniBoxDataSource(
+            load_path = load_path, boxsize = boxsize, minisize = minisize,
+            particle_type = particle_type, seed_prop_names = seed_prop_names,
+            padding = padding,
+        )
+    region_ids = data_source.region_ids()
+    n_regions = len(region_ids)
     
-    # Cap the number of threads to the total number of mini-boxes to process
+    # Cap the number of threads to the total number of mini-boxes/regions to process
     if n_threads is None:
-        n_threads = min(max(1, os.cpu_count()//2), n_mini_boxes)
+        n_threads = min(max(1, os.cpu_count()//2), n_regions)
     else:
-        n_threads = min(n_threads, n_mini_boxes)
+        n_threads = min(n_threads, n_regions)
 
     # Parallel processing of miniboxes.
     func = partial(
@@ -1346,6 +1360,7 @@ def process_all_miniboxes(
         padding=padding, 
         fast_mass=fast_mass, 
         disable_tqdm=True,
+        data_source=data_source,
     )
     
     # Safely handle multiprocessing falure with a fall back to a single thread.
@@ -1353,11 +1368,10 @@ def process_all_miniboxes(
         # Submit the most expensive (most populated) mini-boxes first so a few
         # dense boxes do not end up running alone at the end of the run. Each
         # mini-box is independent, so the order does not change the output.
-        box_order = _mini_boxes_by_workload(load_path, boxsize, minisize,
-                                            particle_type, n_mini_boxes)
+        box_order = data_source.region_ids_by_workload()
         try:
             with Pool(n_threads) as pool, \
-                tqdm(total=n_mini_boxes, colour="green", ncols=100,
+                tqdm(total=n_regions, colour="green", ncols=100,
                     desc='Generating halo catalogue') as pbar:
                 for _ in pool.imap_unordered(func, box_order):
                     pbar.update()
@@ -1367,36 +1381,11 @@ def process_all_miniboxes(
             raise RuntimeError(e)
     
     if n_threads == 1:
-        for box_i in tqdm(range(n_mini_boxes), colour="green", ncols=100,
+        for box_i in tqdm(region_ids, colour="green", ncols=100,
                         desc='Generating halo catalogue'):
             func(box_i)
 
     return None
-
-
-def _mini_boxes_by_workload(
-    load_path: str,
-    boxsize: float,
-    minisize: float,
-    particle_type: str,
-    n_mini_boxes: int,
-) -> list[int]:
-    """Return mini-box IDs sorted by number of particles, largest first.
-
-    Only reads dataset shapes, not the data. Boxes whose file cannot be read
-    are placed last.
-    """
-    cells_per_side = int(numpy.ceil(boxsize / minisize))
-    counts = numpy.zeros(n_mini_boxes, dtype=numpy.int64)
-    for box_id in range(n_mini_boxes):
-        file_name = load_path + f'mini_boxes_nside_{cells_per_side}/{box_id}.hdf5'
-        try:
-            with h5py.File(file_name, 'r') as hdf:
-                counts[box_id] = hdf[f'{particle_type}/ID'].shape[0]
-        except (OSError, KeyError):
-            counts[box_id] = -1
-    # Stable sort keeps the natural ID order among equally populated boxes.
-    return numpy.argsort(-counts, kind='stable').tolist()
 
 
 def append_dataset(group: h5py.Group, name: str, data: numpy.ndarray) -> None:
@@ -1594,6 +1583,7 @@ def run_orbiting_mass_assignment(
     fast_mass: bool = False,
     n_threads: int = None,
     cleanup: bool | str = False,
+    data_source: SpatialDataSource | None = None,
 ) -> None:
     """Generate complete halo catalog using kinetic energy classification.
 
@@ -1720,6 +1710,7 @@ def run_orbiting_mass_assignment(
         seed_prop_names=seed_prop_names,
         fast_mass=fast_mass,
         n_threads=n_threads,
+        data_source = data_source,
     )
 
     merge_catalogues(
