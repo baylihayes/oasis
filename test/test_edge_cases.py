@@ -1,6 +1,7 @@
 """Regression tests for edge cases fixed during the performance refactor."""
 import numpy as np
 import h5py
+from scipy.spatial import cKDTree
 
 from oasis import calibration, minibox
 from oasis.catalogue import MiniBoxClassifier, run_orbiting_mass_assignment, _offset_indices, merge_catalogues
@@ -136,3 +137,30 @@ def test_merge_offsets_member_indices(tmp_path):
         np.testing.assert_array_equal(f['RIDX'][()], [3, 5, 9])
         np.testing.assert_array_equal(f['SLIDX'][()], [0, -1, 1])
         np.testing.assert_array_equal(f['SRIDX'][()], [1, -1, 3])
+
+
+def test_positions_rounding_up_to_boxsize_are_wrapped(tmp_path):
+    """A position just below boxsize must not be stored as exactly boxsize
+    (float32 rounding), which would crash the periodic KD-tree."""
+    path = str(tmp_path) + '/'
+    box = 100.0
+    pos = np.array([[box - 1e-9, 50.0, 50.0],    # rounds to 100.0 in float32
+                    [50.0, box - 1e-9, 50.0],
+                    [10.0, 20.0, 30.0]])          # ordinary particle
+    minibox.process_simulation_data(
+        save_path=path, particle_type='dm', boxsize=box, minisize=50.0,
+        positions=pos, velocities=np.zeros((3, 3)), ids=np.arange(3),
+        mass=(1e10, 'mass'), n_threads=1)
+
+    stored = {}
+    for fname in (tmp_path / 'mini_boxes_nside_2').glob('*.hdf5'):
+        with h5py.File(fname) as f:
+            for i, p in zip(f['dm/ID'][()], f['dm/pos'][()]):
+                stored[int(i)] = (int(fname.stem), p)
+    allpos = np.array([p for _, p in stored.values()])
+
+    assert np.all(allpos >= 0) and np.all(allpos < box)
+    np.testing.assert_allclose(stored[0][1], np.float32([0.0, 50.0, 50.0]), atol=1e-6)
+    np.testing.assert_allclose(stored[1][1], np.float32([50.0, 0.0, 50.0]), atol=1e-6)
+    np.testing.assert_array_equal(stored[2][1], np.float32([10.0, 20.0, 30.0]))
+    cKDTree(allpos, boxsize=box)    # raised ValueError before the fix

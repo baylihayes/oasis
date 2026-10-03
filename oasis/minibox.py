@@ -335,6 +335,13 @@ def split_simulation_into_mini_boxes(
     # Trim values outside boxsize due to floating point precision
     positions = numpy.mod(positions, boxsize)
 
+    # Positions are stored as float32. Values just below 'boxsize' can round up
+    # to exactly 'boxsize' (or above) in float32, which the periodic KD-trees
+    # reject. Such a position is periodically equivalent to 0, so store it as 0. 
+    on_edge = positions.astype(numpy.float32).astype(numpy.float64) >= boxsize
+    if numpy.any(on_edge):
+        positions[on_edge] = 0.0
+
     # Compute mini-box IDs for all objects in chunks with size of the average 
     # number of items per mini-box to improve computation speed and reduce 
     # memory usage. This is important for large simulations with billions of 
