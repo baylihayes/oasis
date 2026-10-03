@@ -1410,6 +1410,13 @@ def append_dataset(group: h5py.Group, name: str, data: numpy.ndarray) -> None:
         group.create_dataset(name=name, data=data, chunks=True, maxshape=(None,))
     return
 
+def _offset_indices(data: numpy.ndarray, offset: int) -> numpy.ndarray:
+    """
+    Shift per-file member indices by 'offset' using 64-bit integers, so the 
+    merged indices cannot overflow however large the catalogue is. 
+    
+    """
+    return data.astype(numpy.int64) + offset
 
 def merge_catalogues(
     load_path: str,
@@ -1534,8 +1541,9 @@ def merge_catalogues(
 
         halo_out = {}
         for key, (dtype, tail) in halo_specs.items():
-            if key in {'SLIDX', 'SRIDX'}:
-                dtype = numpy.int32
+            if key in {'LIDX', 'RIDX', 'SLIDX', 'SRIDX'}:
+                # Merged indices can exceed 32-bit limits; SLIDX/SRIDX also need -1
+                dtype = numpy.int64
             halo_out[key] = hdf.create_dataset(key, shape=(n_halo_tot,) + tail,
                                                dtype=dtype)
 
@@ -1552,9 +1560,9 @@ def merge_catalogues(
                     data = hdf_load[f"halo/{key}"][()]
                     # Offset indices by number of objects in previous files
                     if key in {"LIDX", "RIDX"}:
-                        data += p0
+                        data = _offset_indices(data,p0)
                     elif key in {"SLIDX", "SRIDX"}:
-                        data += s0
+                        data = _offset_indices(data,s0)
                     halo_out[key][h0:h0 + nh] = data
 
         # Set the seed index to -1 for all those haloes without subhaloes.

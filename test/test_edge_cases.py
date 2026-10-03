@@ -3,7 +3,7 @@ import numpy as np
 import h5py
 
 from oasis import calibration, minibox
-from oasis.catalogue import MiniBoxClassifier, run_orbiting_mass_assignment
+from oasis.catalogue import MiniBoxClassifier, run_orbiting_mass_assignment, _offset_indices, merge_catalogues
 
 
 
@@ -95,3 +95,44 @@ def test_large_halo_ids_survive_catalogue(tmp_path):
     assert set(hid.tolist()) <= set(big.tolist())   # every ID unchanged
     assert big[0] in hid
 
+def test_offset_indices_do_not_overflow():
+    """Offsetting 32-bit indices past the uint32 limit must stay exact."""
+    data = np.array([0, 3_000_000_000, 4_294_967_295], dtype=np.uint32)
+    out = _offset_indices(data, 5_000_000_000)
+    assert out.dtype == np.int64
+    np.testing.assert_array_equal(
+        out, [5_000_000_000, 8_000_000_000, 9_294_967_295])
+
+def _write_minibox_catalogue(path, n_memb, lidx, ridx, slidx, sridx, n_sub):
+    """Write a tiny hand-made mini-box catalogue file as _save_catalogues does."""
+    n = len(lidx)
+    with h5py.File(path, 'w') as hdf:
+        for key, val, dt in (
+            ('Halo_ID', np.arange(n), np.int64), ('Norb', np.ones(n), np.uint32),
+            ('LIDX', lidx, np.uint32), ('RIDX', ridx, np.uint32),
+            ('NSUBS', np.asarray(sridx) - np.asarray(slidx), np.uint32),
+            ('PID', np.full(n, -1), np.int64),
+            ('SLIDX', slidx, np.uint32), ('SRIDX', sridx, np.uint32)):
+            hdf.create_dataset(f'halo/{key}', data=val, dtype=dt)
+        hdf.create_dataset('memb/PID', data=np.arange(n_memb), dtype=np.uint32)
+        if n_sub:
+            hdf.create_dataset('memb/Halo_ID', data=np.arange(n_sub), dtype=np.int64)
+
+def test_merge_offsets_member_indices(tmp_path):
+    """Merged LIDX/RIDX/SLIDX/SRIDX are int64, offset by previous files,
+    and haloes without substructure get -1."""
+    load_path = str(tmp_path) + '/'
+    cat_dir = tmp_path / 'run_t' / 'mini_box_catalogues'
+    cat_dir.mkdir(parents=True)
+    # File 0: two haloes with 3 and 2 members; first halo has 1 subhalo.
+    _write_minibox_catalogue(cat_dir / '0.hdf5', 5, [0, 3], [3, 5], [0, 1], [1, 1], 1)
+    # File 1: one halo with 4 members and 2 subhaloes.
+    _write_minibox_catalogue(cat_dir / '1.hdf5', 4, [0], [4], [0], [2], 2)
+    merge_catalogues(load_path=load_path, run_name='t')
+    with h5py.File(load_path + 'run_t/catalogue.hdf5') as f:
+        for key in ('LIDX', 'RIDX', 'SLIDX', 'SRIDX'):
+            assert f[key].dtype == np.int64
+        np.testing.assert_array_equal(f['LIDX'][()], [0, 3, 5])
+        np.testing.assert_array_equal(f['RIDX'][()], [3, 5, 9])
+        np.testing.assert_array_equal(f['SLIDX'][()], [0, -1, 1])
+        np.testing.assert_array_equal(f['SRIDX'][()], [1, -1, 3])
