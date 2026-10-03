@@ -1068,7 +1068,7 @@ class MiniBoxClassifier:
 
         full_path = self.save_path + f"{self.mini_box_id}.hdf5"
         dtypes = (
-            numpy.uint32,   # Halo_ID
+            numpy.int64,   # Halo_ID
             numpy.float32,  # pos
             numpy.float32,  # vel
             numpy.float32,  # R200b
@@ -1079,7 +1079,7 @@ class MiniBoxClassifier:
             numpy.uint32,   # RIDX
             None,           # INMB is ignored
             numpy.uint32,   # NSUBS
-            numpy.int32,    # PID
+            numpy.int64,    # PID
             numpy.uint32,   # SLIDX
             numpy.uint32    # SRIDX
         )

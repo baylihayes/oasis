@@ -1,8 +1,10 @@
 """Regression tests for edge cases fixed during the performance refactor."""
 import numpy as np
+import h5py
 
 from oasis import calibration, minibox
-from oasis.catalogue import MiniBoxClassifier
+from oasis.catalogue import MiniBoxClassifier, run_orbiting_mass_assignment
+
 
 
 def _write_seeds(path, boxsize, minisize, pos, ids):
@@ -68,3 +70,28 @@ def test_no_duplicate_loading_with_two_cells_per_side(tmp_path):
 
     _, _, hid, *_ = minibox.load_seeds(0, 10.0, 5.0, path, padding=1.0)
     assert len(hid) == len(np.unique(hid))
+
+def test_large_halo_ids_survive_catalogue(tmp_path):
+    """Halo and parent IDs above the 32-bit range must be written unchanged."""
+    path = str(tmp_path) + '/'
+    big = np.array([5_000_000_000, 5_000_000_001], dtype=np.int64)   # > 2**32
+    # Host at the centre, a slower-moving companion inside it so it becomes a subhalo.
+    _write_seeds(path, 10.0, 10.0, np.array([[5.0, 5.0, 5.0], [5.2, 5.0, 5.0]]), big)
+    rng = np.random.default_rng(2)
+    n = 3000
+    pos = np.vstack([5.0 + rng.normal(scale=0.15, size=(n, 3)),
+                     np.array([5.2, 5.0, 5.0]) + rng.normal(scale=0.03, size=(300, 3))])
+    minibox.process_simulation_data(
+        save_path=path, particle_type='dm', boxsize=10.0, minisize=10.0,
+        positions=np.mod(pos, 10.0), velocities=rng.normal(scale=50.0, size=(len(pos), 3)),
+        ids=np.arange(len(pos)), mass=(1e10, 'mass'), n_threads=1)
+    calibration.calibrate(save_path=path, omega_m=0.3)
+    run_orbiting_mass_assignment(
+        load_path=path, run_name='t', min_num_part=20, boxsize=10.0, minisize=10.0,
+        padding=1.0, particle_type='dm', redshift=0.0, n_threads=1)
+    with h5py.File(path + 'run_t/catalogue.hdf5') as f:
+        hid, pid = f['Halo_ID'][()], f['PID'][()]
+    assert hid.dtype == np.int64 and pid.dtype == np.int64
+    assert set(hid.tolist()) <= set(big.tolist())   # every ID unchanged
+    assert big[0] in hid
+
