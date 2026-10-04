@@ -164,3 +164,42 @@ def test_positions_rounding_up_to_boxsize_are_wrapped(tmp_path):
     np.testing.assert_allclose(stored[1][1], np.float32([50.0, 0.0, 50.0]), atol=1e-6)
     np.testing.assert_array_equal(stored[2][1], np.float32([10.0, 20.0, 30.0]))
     cKDTree(allpos, boxsize=box)    # raised ValueError before the fix
+
+class _PoolThatFailsAfterOneResult:
+    """Stands in for multiprocessing.Pool: returns one result, then fails."""
+    def __init__(self, n_threads):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def imap(self, func, args):
+        args = list(args)
+        yield func(args[0])
+        raise RuntimeError("simulated worker crash")
+
+
+def test_calibration_parallel_failure_does_not_duplicate(tmp_path, monkeypatch):
+    """If the worker pool fails partway, the sequential fallback must give the
+    same calibration data as a purely sequential run (no duplicated mini-boxes)."""
+    path = str(tmp_path) + '/'
+    rng = np.random.default_rng(3)
+    seeds = np.array([[2.5, 2.5, 2.5], [7.5, 2.5, 2.5],
+                      [2.5, 7.5, 2.5], [7.5, 7.5, 7.5]])     # 4 different mini-boxes
+    pos = np.vstack([s + rng.normal(scale=0.3, size=(500, 3)) for s in seeds])
+    minibox.process_simulation_data(
+        save_path=path, particle_type='dm', boxsize=10.0, minisize=5.0,
+        positions=np.mod(pos, 10.0), velocities=rng.normal(scale=50.0, size=(len(pos), 3)),
+        ids=np.arange(len(pos)), mass=(1e10, 'mass'), n_threads=1)
+    kwargs = dict(n_seeds=4,
+                  seed_data=(seeds, np.zeros((4, 3)), np.full(4, 1e13), np.full(4, 0.5)),
+                  r_max=1.0, boxsize=10.0, minisize=5.0, load_path=path,
+                  particle_type='dm', mass_density=1e10, redshift=0.0)
+
+    expected = calibration._select_candidate_seeds(**kwargs, n_threads=1)
+    monkeypatch.setattr(calibration, 'Pool', _PoolThatFailsAfterOneResult)
+    got = calibration._select_candidate_seeds(**kwargs, n_threads=4)
+    np.testing.assert_array_equal(got, expected)

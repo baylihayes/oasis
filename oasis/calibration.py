@@ -797,6 +797,9 @@ def _select_candidate_seeds(
         except Exception as e:
             print(
                 f"Warning: Parallel processing failed ({e}), falling back to sequential")
+            # Discard anything in the pool returned before failing, so the
+            # sequential pass below does not add those miniboxes a second time.
+            results = []
             # Fall back to sequential processing
             n_threads = 1
 
