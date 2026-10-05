@@ -162,6 +162,9 @@ def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
             fields = {k: (np.asarray(v).dtype, np.shape(v)[1:])
                       for k, v in chunk.items()}
             fields['pos'] = (np.dtype(np.float32), (3,))
+            if 'vel' in fields:
+                #   Velocities are stored as float32, like the minibox files.
+                fields['vel'] = (np.dtype(np.float32), (3,))
     if fields is None:
         raise ValueError(f"No input chunks for '{kind}': make_chunks() yielded nothing. "
                          "Check input path.")
@@ -181,6 +184,8 @@ def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
         cursor = np.zeros(spec.n_tiles, dtype = np.int64)
         for chunk in make_chunks():                 # pass 2: write
             chunk = dict(chunk, pos = wrap_positions(chunk['pos'], spec.boxsize))
+            if 'vel' in chunk:
+                chunk['vel'] = np.asarray(chunk['vel'], dtype = np.float32)
             rows, tiles, in_core = assign_to_tiles(chunk['pos'], spec)
             order = np.argsort(tiles, kind = 'stable')
             rows, tiles, in_core = rows[order], tiles[order], in_core[order]

@@ -153,3 +153,20 @@ def test_existing_tiles_refused_unless_overwrite(tmp_path):
     assert second.keys() == first.keys()
     for key in first:
         np.testing.assert_array_equal(first[key], second[key])
+
+def test_velocities_stored_as_float32(tmp_path):
+    """float64 input velocities are stored as float32, like the mini-box files."""
+    spec = TileSpec(boxsize=L, tiles_per_side=2, buffer_width=5.0, inner_cell_size=10.0)
+    parts, seeds = _make_inputs()
+    rng = np.random.default_rng(5)
+    parts['vel'] = rng.normal(scale=300.0, size=(len(parts['ID']), 3))   # float64
+    seeds['vel'] = rng.normal(scale=300.0, size=(len(seeds['ID']), 3))   # float64
+    build_tiles(_chunks(parts, 1000), _chunks(seeds, 50), str(tmp_path), spec)
+    for t in range(spec.n_tiles):
+        with h5py.File(tmp_path / f'tile_{t}.hdf5') as f:
+            for kind, src in (('particles', parts), ('seeds', seeds)):
+                group = f[kind]
+                assert group['vel'].dtype == np.float32
+                np.testing.assert_array_equal(
+                    group['vel'][()], src['vel'][group['ID'][()]].astype(np.float32))
+ 

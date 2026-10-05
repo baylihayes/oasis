@@ -14,7 +14,7 @@ import h5py
 import numpy as np
 
 from oasis.minibox import load_particles, load_seeds
-
+from oasis.coordinates import _periodic_displacement
 
 
 @dataclass
@@ -130,3 +130,112 @@ class LegacyMiniBoxDataSource(SpatialDataSource):
             region_id, self.boxsize, self.minisize, self.load_path,
             self.particle_type, self.padding)
         return ParticleSet(pos, vel, pid, mass)
+
+class BufferedTileDataSource(SpatialDataSource):
+    """
+    Served the inner cells of one prebuilt core + ribbon tile (see oasis.tiles)
+    
+    Regions are the tile's CORE cells, identified by their local cell ID. Each
+    region is a cell plus 'padding', read fro the cell and its neighbors with 
+    direct slices (rows are grouped by cell, see 'cell_offset'). Ribbon cells are
+    only ever read as neighbors, never processed as regions.
+
+    """
+
+    def __init__(self, tile_path, padding = 5.0,
+                 seed_prop_names = ('M200b', 'R200b', 'Rs')):
+        self.tile_path = tile_path
+        self.padding = padding
+        self.seed_prop_names = seed_prop_names
+        with h5py.File(tile_path, 'r') as f:
+            meta = f['tile_metadata'].attrs
+            self.boxsize = float(meta['global_boxsize'])
+            self.cell_size = float(meta['inner_cell_size'])
+            self.buffer_width = float(meta['buffer_width'])
+            self.ring = int(meta['ring'])
+            self.m = int(meta['cells_per_side'])
+            core_min = np.asarray(meta['core_bounds'])[:,0]
+            # stored as float32 like the minibox files, so Morb = N*m is
+            # computed with the same precision as before
+            self.particle_mass = (np.float32(meta['particle_mass'])
+                                    if 'particle_mass' in meta else None)
+            self._n_part_per_cell = np.diff(f['particles/cell_offset'][()])
+        if padding > self.buffer_width:
+            raise ValueError(
+                f"padding ({padding}) is larger than tile's ribbon"
+                f" ({self.buffer_width}): rows near the core edge would be missing.")
+        # Neighbor layers needed to cover 'padding' (at most 'ring').
+        self.layers = int(np.ceil(padding / self.cell_size))
+        # Global index of the tile's first core cell along each axis
+        self._g0 = np.rint(core_min / self.cell_size).astype(np.int64)
+
+    # -- geometry --------------------------------------------------------
+    def _ijk(self, cell):
+        m = self.m
+        return np.array([cell % m , (cell // m) % m, cell // m**2])
+
+    def region_center(self, region_id):
+        """Center of a core cell in global coordinates, computed with the same 
+        formula as the minibox loader: (global cell index + 0.5) * size."""
+        g = self._g0 + self._ijk(region_id) - self.ring
+        return (g + 0.5) * self.cell_size
+
+    def region_ids(self):
+        r, m = self.ring, self.m
+        core = range(r, m - r)
+        return [i + j * m + k * m**2 for k in core for j in core for i in core]
+
+    def region_ids_by_workload(self):
+        ids = np.array(self.region_ids())
+        return ids[np.argsort(-self._n_part_per_cell[ids], kind='stable')].tolist()
+
+    # -- reading ----------------------------------------------------------
+    def _read(self, group, cell):
+        """Rows of 'cell' and its neighbors (self.layers deep), and a mask of 
+        the rows that belong to 'cell' itself."""
+        i, j, k = self._ijk(cell)
+        L, m = self.layers, self.m
+        offsets = group['cell_offset'][()]
+        names = [n for n in group.keys() if n != 'cell_offset']
+        pieces = {n: [] for n in names}
+        own = []
+        for dz in range(-L, L + 1):
+            for dy in range(-L, L + 1):
+                # Cells next to each other in x are next to each other on disk,
+                # so each (dy, dz) row of 2L + 1 cells is one contiguous slice.
+                first = (i - L) + (j + dy) * m + (k + dz) * m**2
+                a, b = offsets[first], offsets[first + 2 * L + 1]
+                for n in names:
+                    pieces[n].append(group[n][a:b])
+                mask = np.zeros(b - a, dtype = bool)
+                if dy == 0 and dz == 0:
+                    mask[offsets[cell] - a:offsets[cell + 1] - a] = True
+                own.append(mask)
+        return ({n: np.concatenate(v) for n, v in pieces.items()},
+                np.concatenate(own))
+
+    def _within_padding(self, pos, region_id):
+        """Same cut as the minibox loader: |x - center| <= size / 2 + padding"""
+        rel = _periodic_displacement(pos, self.region_center(region_id), self.boxsize)
+        return np.all(np.abs(rel) <= 0.5 * self.cell_size + self.padding, axis = 1)
+
+    def load_seeds(self, region_id):
+        with h5py.File(self.tile_path, 'r') as f:
+            data, own = self._read(f['seeds'], region_id)
+        keep = self._within_padding(data['pos'], region_id)
+        m200, r200, rs = self.seed_prop_names
+        return SeedSet(
+            pos = data['pos'][keep], vel = data['vel'][keep], hid = data['ID'][keep],
+            r200b = data[r200][keep], m200b = data[m200][keep], rs = data[rs][keep],
+            # Owned only if in this cell and in the tile's core.
+            in_core = (own & data['in_core'])[keep],
+        )
+
+    def load_particles(self, region_id):
+        with h5py.File(self.tile_path, 'r') as f:
+            data, _ = self._read(f['particles'], region_id)
+        keep = self._within_padding(data['pos'], region_id)
+        mass = (self.particle_mass if self.particle_mass is not None 
+                else data['mass'][keep])
+        return ParticleSet(data['pos'][keep], data['vel'][keep],
+                           data['ID'][keep], mass)

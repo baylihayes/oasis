@@ -4,13 +4,15 @@ Tests for the data-source layer.
 """
 import h5py
 import numpy as np
+import pytest
 
 from oasis.calibration import calibrate
 from oasis.catalogue import MiniBoxClassifier, run_orbiting_mass_assignment
 from oasis.coordinates import relative_coordinates
 from oasis.datasource import (LegacyMiniBoxDataSource, ParticleSet, SeedSet,
-                              SpatialDataSource)
+                              SpatialDataSource, BufferedTileDataSource)
 from oasis.minibox import get_mini_box_id, process_simulation_data
+from oasis.tiles import TileSpec, build_tiles
 
 BOX, MINI, PAD, MP = 100.0, 25.0, 5.0, 1e10
 
@@ -175,3 +177,92 @@ def test_catalogue_is_invariant_under_periodic_shift(tmp_path):
     for i, j in zip(ia, ib):
         np.testing.assert_array_equal(np.sort(pa[ca['LIDX'][i]:ca['RIDX'][i]]),
                                       np.sort(pb[cb['LIDX'][j]:cb['RIDX'][j]]))
+
+###################### TILE TESTS #############################################
+
+# 2 tiles per side (core 50), ribbon = padding = 5, cells = mini-boxes = 25.
+TILE_SPEC = TileSpec(boxsize=BOX, tiles_per_side=2, buffer_width=PAD,
+                     inner_cell_size=MINI)
+
+def _build_tiles_from_box(d, out_dir, spec=TILE_SPEC):
+    """Build tiles from the same synthetic box, with the same float32 types
+    the mini-box writer uses."""
+    f32 = np.float32
+    parts = dict(ID=d['pid'], pos=d['pos'], vel=d['vel'].astype(f32))
+    seeds = dict(ID=d['hid'], pos=d['s_pos'], vel=d['s_vel'].astype(f32),
+                 M200b=d['m200b'].astype(f32), R200b=d['r200b'].astype(f32),
+                 Rs=d['rs'].astype(f32))
+    one_chunk = lambda arrays: (lambda: iter([arrays]))
+    build_tiles(one_chunk(parts), one_chunk(seeds), out_dir, spec, particle_mass=MP)
+
+def _tile_sources(tile_dir, spec=TILE_SPEC):
+    return [BufferedTileDataSource(f'{tile_dir}/tile_{t}.hdf5', padding=PAD)
+            for t in range(spec.n_tiles)]
+
+def _matching_mini_box(tile, region):
+    return int(get_mini_box_id(tile.region_center(region).copy(), BOX, MINI))
+
+def test_tile_regions_are_core_cells(tmp_path):
+    _build_tiles_from_box(_make_box(), str(tmp_path))
+    tile = _tile_sources(tmp_path)[0]
+    assert len(tile.region_ids()) == (tile.m - 2 * tile.ring) ** 3   # 2x2x2 core cells
+    assert sorted(tile.region_ids_by_workload()) == sorted(tile.region_ids())
+
+def test_tile_source_rejects_padding_wider_than_ribbon(tmp_path):
+    _build_tiles_from_box(_make_box(), str(tmp_path))
+    with pytest.raises(ValueError):
+        BufferedTileDataSource(str(tmp_path / 'tile_0.hdf5'), padding=PAD + 1.0)
+
+def test_tile_source_serves_same_data_as_mini_boxes(tmp_path):
+    path = str(tmp_path) + '/'
+    d = _make_box()
+    _write_box(path, d)                                   # mini-box files
+    _build_tiles_from_box(d, path + 'tiles')              # tiles of the same data
+    legacy = LegacyMiniBoxDataSource(path, BOX, MINI, 'dm', padding=PAD)
+    covered = []
+    for tile in _tile_sources(path + 'tiles'):
+        for region in tile.region_ids():
+            box_id = _matching_mini_box(tile, region)
+            covered.append(box_id)
+            a, b = legacy.load_seeds(box_id), tile.load_seeds(region)
+            assert len(a) == len(b)
+            if len(a):
+                ia, ib = np.argsort(a.hid), np.argsort(b.hid)
+                for name in ('hid', 'pos', 'vel', 'm200b', 'r200b', 'rs', 'in_core'):
+                    np.testing.assert_array_equal(np.asarray(getattr(a, name))[ia],
+                                                  np.asarray(getattr(b, name))[ib])
+            pa, pb = legacy.load_particles(box_id), tile.load_particles(region)
+            ia, ib = np.argsort(pa.pid), np.argsort(pb.pid)
+            for name in ('pid', 'pos', 'vel'):
+                np.testing.assert_array_equal(getattr(pa, name)[ia], getattr(pb, name)[ib])
+            assert pa.mass == pb.mass
+    # every mini-box is matched by exactly one tile core cell
+    assert sorted(covered) == list(range(int(BOX / MINI) ** 3))
+
+def test_classifier_on_tiles_matches_mini_boxes(tmp_path):
+    path = str(tmp_path) + '/'
+    d = _make_box()
+    _write_box(path, d)
+    _build_tiles_from_box(d, path + 'tiles')
+    calibrate(save_path=path, omega_m=0.3)
+    kw = dict(min_num_part=10, boxsize=BOX, minisize=MINI, load_path=path,
+              particle_type='dm', seed_prop_names=('M200b', 'R200b', 'Rs'),
+              redshift=0.0, padding=PAD)
+    n_haloes = 0
+    for tile in _tile_sources(path + 'tiles'):
+        for region in tile.region_ids():
+            box_id = _matching_mini_box(tile, region)
+            a = _classify_region(MiniBoxClassifier(mini_box_id=box_id, run_name='a', **kw))
+            b = _classify_region(MiniBoxClassifier(mini_box_id=region, run_name='b',
+                                                   data_source=tile, **kw))
+            if a is None or b is None:
+                assert a is None and b is None
+                continue
+            for col in ('Halo_ID', 'Morb', 'Norb', 'NSUBS', 'PID', 'M200b', 'R200b'):
+                np.testing.assert_array_equal(a.haloes_perc[col].to_numpy(),
+                                              b.haloes_perc[col].to_numpy())
+            for lo, hi in zip(a.haloes_perc['LIDX'], a.haloes_perc['RIDX']):
+                np.testing.assert_array_equal(np.sort(a.orb_pid_perc[lo:hi]),
+                                              np.sort(b.orb_pid_perc[lo:hi]))
+            n_haloes += len(a.haloes_perc)
+    assert n_haloes > 0
