@@ -3,10 +3,12 @@ import numpy as np
 import h5py
 from scipy.spatial import cKDTree
 import json
+import pytest
 
 from oasis import calibration, minibox
 from oasis.catalogue import MiniBoxClassifier, run_orbiting_mass_assignment, _offset_indices, merge_catalogues
 from oasis.common import StageTimer
+from oasis.datasource import ParticleSet, SeedSet, SpatialDataSource
 
 
 def _write_seeds(path, boxsize, minisize, pos, ids):
@@ -236,3 +238,52 @@ def test_run_writes_timings(tmp_path):
     assert {'load_seeds', 'load_particles', 'classification', 'percolation'} \
         <= set(t['region_stage_totals'])
     assert t['n_regions'] == 1 and t['n_seeds'] == 1 and t['n_particles_loaded'] == 4000    
+
+
+class _TiedSeedsSource(SpatialDataSource):
+    """Five seeds, three with identical M200b, served in a given order."""
+    boxsize = 10.0
+
+    def __init__(self, order):
+        hid = np.array([40, 10, 30, 20, 50])
+        m200b = np.array([1e13, 2e13, 1e13, 1e13, 5e12], dtype=np.float32)
+        self.seeds = SeedSet(pos=np.full((5, 3), 5.0, np.float32), vel=np.zeros((5, 3), np.float32),
+                             hid=hid[order], r200b=np.full(5, 0.5, np.float32),
+                             m200b=m200b[order], rs=np.full(5, 0.1, np.float32),
+                             in_core=np.ones(5, bool))
+
+    def region_ids(self):
+        return [0]
+
+    def load_seeds(self, region_id):
+        return self.seeds
+
+    def load_particles(self, region_id):
+        raise NotImplementedError
+
+
+def _seed_order(order, tie_break):
+    clf = MiniBoxClassifier(mini_box_id=0, min_num_part=1, boxsize=10.0, minisize=10.0,
+                            load_path='', run_name='t', particle_type='dm',
+                            seed_prop_names=('M200b', 'R200b', 'Rs'), redshift=0.0,
+                            data_source=_TiedSeedsSource(order), seed_tie_break=tie_break)
+    clf._load_seeds_and_filter()
+    return clf.hid.tolist()
+
+
+def test_halo_id_tie_break_is_independent_of_load_order():
+    """With the default, seeds with equal M200b are processed by increasing
+    Halo_ID, whatever order the data source returns them in."""
+    for order in ([0, 1, 2, 3, 4], [4, 3, 2, 1, 0], [2, 4, 0, 3, 1]):
+        assert _seed_order(order, 'halo_id') == [10, 20, 30, 40, 50]
+
+
+def test_load_order_tie_break_keeps_source_order():
+    """'load_order' keeps equal masses in the order the source gave them."""
+    assert _seed_order([0, 1, 2, 3, 4], 'load_order') == [10, 40, 30, 20, 50]
+    assert _seed_order([4, 3, 2, 1, 0], 'load_order') == [10, 20, 30, 40, 50]
+
+
+def test_invalid_tie_break_rejected():
+    with pytest.raises(ValueError):
+        _seed_order([0, 1, 2, 3, 4], 'alphabetical')

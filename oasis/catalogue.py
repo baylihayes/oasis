@@ -64,6 +64,7 @@ class MiniBoxClassifier:
         fast_mass: bool = False,
         disable_tqdm: bool = True,
         data_source: SpatialDataSource | None = None,
+        seed_tie_break: str = 'halo_id',
     ):
         # Input parameters
         self.mini_box_id = mini_box_id
@@ -94,6 +95,16 @@ class MiniBoxClassifier:
             )
         self.data_source = data_source
 
+        # How seeds with exactly equal M200b are ordered for processing:
+        # 'halo_id'    - by increasing Halo_ID, independent of how the data is
+        #                stored (tiles, mini-box size, file order). Default.
+        # 'load_order' - in the order the data source returns them; reproduces
+        #                the reference code exactly (used for regression checks).
+        if seed_tie_break not in ('halo_id', 'load_order'):
+            raise ValueError(f"seed_tie_break must be 'halo_id' or 'load_order', "
+                             f"got {seed_tie_break!r}")
+        self.seed_tie_break = seed_tie_break
+
         # Internal parameters
         self.save_path = None
         # Seed properties
@@ -121,11 +132,15 @@ class MiniBoxClassifier:
             self.n_seeds = 0
             return
 
-        # Process seeds in descending M200b order. The stable sort keeps the
-        # order of equal masses exactly as the data source gave them, so it 
-        # changes nothing for the legacy source (already sorted) and is 
-        # deterministic for any other source. 
-        order = numpy.argsort(-seeds.m200b, kind = 'stable')
+        # Process seeds in descending M200b order.
+        if self.seed_tie_break == 'halo_id':
+            # Equal masses in increasing Halo_ID, so the order does not depend
+            # on how the data is stored.
+            order = numpy.lexsort((seeds.hid, -seeds.m200b))
+        else:
+            # Equal masses in the order the data source gave them (stable sort);
+            # for mini-box files this reproduces the reference code exactly. 
+            order = numpy.argsort(-seeds.m200b, kind = 'stable')
         self.pos_seed = seeds.pos[order]
         self.vel_seed = seeds.vel[order]
         self.hid = seeds.hid[order]
@@ -1281,6 +1296,7 @@ def process_all_miniboxes(
     fast_mass: bool = False,
     n_threads: int = None,
     data_source: SpatialDataSource | None = None,
+    seed_tie_break: str = 'halo_id',
 ) -> None:
     """Process all mini-boxes in parallel to generate individual halo catalogs.
 
@@ -1397,6 +1413,7 @@ def process_all_miniboxes(
         fast_mass=fast_mass, 
         disable_tqdm=True,
         data_source=data_source,
+        seed_tie_break = seed_tie_break,
     )
     
     # Safely handle multiprocessing falure with a fall back to a single thread.
@@ -1665,6 +1682,7 @@ def run_orbiting_mass_assignment(
     n_threads: int = None,
     cleanup: bool | str = False,
     data_source: SpatialDataSource | None = None,
+    seed_tie_break: str = 'halo_id',
 ) -> None:
     """Generate complete halo catalog using kinetic energy classification.
 
@@ -1795,6 +1813,7 @@ def run_orbiting_mass_assignment(
             fast_mass=fast_mass,
             n_threads=n_threads,
             data_source = data_source,
+            seed_tie_break = seed_tie_break,
         )
     with timer('merge'):
         merge_catalogues(
@@ -1830,6 +1849,7 @@ def run_tiled_orbiting_mass_assignment(
     seed_prop_names: tuple[str] = ('M200b', 'R200b', 'Rs'),
     fast_mass: bool = False,
     n_threads: int = None,
+    seed_tie_break: str = 'halo_id',
 ) -> None:
     """Run OASIS on pre-built core+ribbon tiles and merge into one catalogue.
 
@@ -1851,7 +1871,7 @@ def run_tiled_orbiting_mass_assignment(
                 boxsize=boxsize, minisize=source.cell_size, padding=padding,
                 particle_type=particle_type, redshift=redshift,
                 seed_prop_names=seed_prop_names, fast_mass=fast_mass,
-                n_threads=n_threads, data_source=source)
+                n_threads=n_threads, data_source=source, seed_tie_break=seed_tie_break)
     with timer('merge'):
         merge_catalogues(load_path=load_path, run_name=run_name)
     with timer('verify'):
