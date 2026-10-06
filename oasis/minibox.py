@@ -587,7 +587,7 @@ def load_particles(
     load_path: Union[str, Path],
     particle_type: str,
     padding: float = 5.0,
-) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
+) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, Union[float, numpy.ndarray]]:
     """
     Load particles from a mini-box and its adjacent neighbors within padding distance.
 
@@ -610,10 +610,12 @@ def load_particles(
         Path to directory containing the mini-box HDF5 files. The directory
         should contain a subdirectory named 'mini_boxes_nside_<xx>/' where <xx>
         is the number of cells per side.
+    particle_type : str
+        Name of the particle group in the mini-box files (e.g. 'dm').
     padding : float, optional
         Maximum distance from mini-box edges to include particles. Particles 
         further than this distance from any edge of the target mini-box will be 
-        excluded. Must be non-negative. Default is 5.0.
+        excluded. Must be positive. Default is 5.0.
 
     Returns
     -------
@@ -626,6 +628,9 @@ def load_particles(
     particle_ids : numpy.ndarray
         Particle IDs with shape (n_particles,) containing unique identifiers
         corresponding to the returned positions and velocities.
+    masses : float or numpy.ndarray
+        Particle mass: a single value for constant-mass particles, otherwise
+        one value per returned particle.
 
     Raises
     ------
@@ -634,16 +639,17 @@ def load_particles(
         not numeric, or load_path is not a string or Path.
     ValueError
         If mini_box_id is negative or invalid for the grid, boxsize or minisize 
-        are non-positive, minisize > boxsize, or padding is negative.
+        are non-positive, minisize > boxsize, or padding is not positive.
     FileNotFoundError
-        If load_path doesn't exist or required mini-box files are missing.
+        If load_path or its 'mini_boxes_nside_<xx>/' folder does not exist.
     NotADirectoryError
         If load_path is not a directory.
     OSError
         If HDF5 files cannot be read or are corrupted.
     ValueError
-        If the mini-box and its neighbours contain no rows at all. (If rows
-        exist but none lie within the padding, empty arrays are returned.)
+        If no file of the mini-box or its neighbours contains particle_type,
+        or if they contain no rows at all. (If rows exist but none lie within
+        the padding, empty arrays are returned.)
 
     See Also
     --------
@@ -653,17 +659,21 @@ def load_particles(
     Notes
     -----
     - Uses periodic boundary conditions when calculating relative coordinates
-    - Loads from all 27 mini-boxes (target + 26 neighbors) to ensure complete
-      coverage within padding distance
-    - Memory usage scales with the number of particles in the 27 mini-boxes
+    - Reads the target mini-box and its 26 neighbours, each file once (fewer
+      files when the grid has fewer than 3 cells per side)
+    - Mini-boxes without a file (nothing in them) and files without
+      particle_type (e.g. seeds only) are skipped
+    - The padding mask is applied to each file as it is read, so memory scales
+      with the selected particles, not with all 27 mini-boxes
 
     Examples
     --------
-    >>> positions, velocities, ids = load_particles(
+    >>> positions, velocities, ids, masses = load_particles(
     ...     mini_box_id=42,
     ...     boxsize=100.0,
     ...     minisize=10.0,
     ...     load_path="/data/simulation/",
+    ...     particle_type="dm",
     ...     padding=2.0
     ... )
     >>> print(f"Loaded {len(positions)} particles")
@@ -691,28 +701,48 @@ def load_particles(
     # Create empty lists (containers) to save the data from file for each ID
     positions, velocities, ids, masses = ([] for _ in range(4))
     n_loaded = 0
+    n_with_type = 0
 
-    # Load all adjacent boxes
-    try:
-        for mini_box in mini_box_ids:
-            file_name = f'mini_boxes_nside_{cells_per_side}/{mini_box}.hdf5'
-            with h5py.File(load_path + file_name, 'r') as hdf:
-                pos_i = hdf[f'{particle_type}/pos'][()]
-                n_loaded += len(pos_i)
-                mask = numpy.all(numpy.abs(_periodic_displacement(
-                    pos_i, center, boxsize)) <= padded_distance, axis=1)
+    # The minibox folder must exist (a missing folder means a wrong
+    # load_path or minisize, not an empty region).
+    box_dir = Path(load_path) / f'mini_boxes_nside_{cells_per_side}'
+    if not box_dir.is_dir():
+        raise FileNotFoundError(f"Minibox folder not found: {box_dir}")
 
-                positions.append(pos_i[mask])
-                velocities.append(hdf[f'{particle_type}/vel'][()][mask])
-                ids.append(hdf[f'{particle_type}/ID'][()][mask])
+    # Load all adjacent boxes. Miniboxes with nothing in them have no file,
+    # and a file may hold seeds but no particles of this type; both are 
+    # skipped. Any other read error is raised.
+    for mini_box in mini_box_ids:
+        file_name = box_dir / f'{mini_box}.hdf5'
+        if not file_name.exists():
+            continue
+        with h5py.File(file_name, 'r') as hdf:
+            if particle_type not in hdf:
+                continue
+            n_with_type += 1
+            pos_i = hdf[f'{particle_type}/pos'][()]
+            n_loaded += len(pos_i)
+            mask = numpy.all(numpy.abs(_periodic_displacement(
+                pos_i, center, boxsize)) <= padded_distance, axis=1)
+
+            positions.append(pos_i[mask])
+            velocities.append(hdf[f'{particle_type}/vel'][()][mask])
+            ids.append(hdf[f'{particle_type}/ID'][()][mask])
                 
-                if hdf[f'{particle_type}/mass'].shape == ():
-                    masses = hdf[f'{particle_type}/mass'][()]
-                else:
-                    masses.append(hdf[f'{particle_type}/mass'][()][mask])
+            if hdf[f'{particle_type}/mass'].shape == ():
+                masses = hdf[f'{particle_type}/mass'][()]
+            else:
+                masses.append(hdf[f'{particle_type}/mass'][()][mask])
+    if n_with_type == 0:
+        raise ValueError(
+            f"No '{particle_type}' particles found in minibox {mini_box_id} or "
+            f"its neighbors in {box_dir}; check particle_type and load_path."
+        )
 
-    except Exception as e:
-        print(f'Particle type not valid. {e}')
+    # No rows in any file (same error as the original code, which raised it
+    # from relative_coordinates on the concatenated array).
+    if n_loaded == 0:
+        raise ValueError("Input positions must contain at least one particle")
 
     # Concatenate all loaded data into single arrays
     positions = numpy.concatenate(positions)
@@ -720,11 +750,6 @@ def load_particles(
     ids = numpy.concatenate(ids)
     if isinstance(masses, list):
         masses = numpy.concatenate(masses)
-
-    # Same error as before when the particle datasets are empty (previously
-    # raised by relative_coordinates on the concatenated array).
-    if n_loaded == 0:
-        raise ValueError("Input positions must contain at least one particle")
 
     return positions, velocities, ids, masses
 

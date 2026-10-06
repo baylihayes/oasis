@@ -1174,18 +1174,70 @@ class TestLoadParticles:
             minibox.load_particles(0, 10.0, 10.0, file_path,
                                    particle_type="part", padding=1.0)
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "load_particles catches every exception while reading files and prints "
-        "'Particle type not valid', so a missing mini-box file surfaces as "
-        "'need at least one array to concatenate'. Remove this marker once "
-        "load_particles lets the FileNotFoundError through."))
-    def test_missing_file_raises_file_not_found(self, tmp_path):
-        subdir = tmp_path / "mini_boxes_nside_1"
-        subdir.mkdir()
-
-        with pytest.raises(FileNotFoundError):
+    def test_missing_mini_box_folder_raises(self, tmp_path):
+        """A missing mini_boxes_nside_<n>/ folder means a wrong load_path or
+        minisize, not an empty region."""
+        with pytest.raises(FileNotFoundError, match="Minibox folder not found"):
             minibox.load_particles(0, 10.0, 10.0, str(tmp_path) + "/",
                                    particle_type="part", padding=1.0)
+
+    def test_wrong_particle_type_raises(self, tmp_path):
+        """A particle type found in none of the files is reported by name."""
+        make_all_particle_files(tmp_path, mini_box_id=0,
+                                boxsize=10.0, minisize=1.0, with_particle=True)
+
+        with pytest.raises(ValueError, match="No 'dm' particles found"):
+            minibox.load_particles(0, 10.0, 1.0, str(tmp_path) + "/",
+                                   particle_type="dm", padding=1.0)
+
+    def test_empty_neighbours_do_not_drop_the_rest(self, tmp_path):
+        """A neighbour without a file (empty mini-box) or with seeds only is
+        skipped, and every other neighbour is still read. The original code
+        stopped reading at the first such neighbour and silently dropped the
+        particles of all the following ones."""
+        boxsize, minisize, padding = 30.0, 10.0, 1.0
+        target = 13                                   # centre of a 3x3x3 grid
+        center = numpy.array([15.0, 15.0, 15.0])
+        neighbours = list(dict.fromkeys(
+            minibox.get_adjacent_mini_box_ids(target, boxsize, minisize).tolist()))
+        missing, seeds_only = neighbours[1], neighbours[2]
+
+        # One particle in each of the 27 mini-boxes, 5.5 from the target's
+        # centre along each offset axis: inside the neighbour, and within
+        # minisize / 2 + padding = 6 of the target's centre.
+        offsets = numpy.array([[i, j, k] for i in (-1, 0, 1)
+                               for j in (-1, 0, 1) for k in (-1, 0, 1)])
+        positions = center + 5.5 * offsets
+        box_of = minibox.get_mini_box_id(positions, boxsize, minisize)
+        subdir = tmp_path / "mini_boxes_nside_3"
+        for box in neighbours:
+            rows = numpy.flatnonzero(box_of == box)
+            if box == missing:
+                continue                              # no file at all
+            if box == seeds_only:
+                _make_seed_file(subdir / f"{box}.hdf5", positions[rows],
+                                numpy.zeros((len(rows), 3)), rows,
+                                numpy.ones(len(rows)), numpy.ones(len(rows)),
+                                numpy.ones(len(rows)))
+                continue
+            _make_particle_file(subdir / f"{box}.hdf5", positions[rows],
+                                numpy.zeros((len(rows), 3)), rows)
+
+        _, _, ids, _ = minibox.load_particles(
+            target, boxsize, minisize, str(tmp_path) + "/",
+            particle_type="part", padding=padding)
+
+        expected = numpy.flatnonzero((box_of != missing) & (box_of != seeds_only))
+        assert sorted(ids.tolist()) == expected.tolist()
+
+    def test_load_path_as_path_object(self, tmp_path):
+        """load_path may be a pathlib.Path, as documented."""
+        make_all_particle_files(tmp_path, mini_box_id=0,
+                                boxsize=10.0, minisize=1.0, with_particle=True)
+
+        _, _, ids, _ = minibox.load_particles(
+            0, 10.0, 1.0, tmp_path, particle_type="part", padding=1.0)
+        assert ids.tolist() == [42]
 
 
 # --------------
