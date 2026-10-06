@@ -432,6 +432,11 @@ def _validate_process_objects(
         if arr.shape[0] != n_items:
             raise ValueError(f"array {i} in data[0] must have {n_items} elements")
 
+    # Check there is one label and one dtype per array. The writer pairs them with 
+    # zip, which would otherwise silently drop the extra entries.
+    if not (len(arrays) == len(labels) == len(dtypes)):
+        raise ValueError("arrays, labels and dtypes in data must have the same length")
+
 
 def _validate_inputs_load(
     mini_box_id: int,
