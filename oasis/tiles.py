@@ -116,7 +116,7 @@ def assign_to_tiles(pos: np.ndarray, spec: TileSpec):
 
     i0 = np.minimum((x // core).astype(np.int64), n - 1)    # core tile per axis
     t = x - i0 * core                                       # position inside core
-    lo = t < w              # also inside the ribbon of the tile below
+    lo = t <= w              # also inside the ribbon of the tile below
     hi = t >= core - w      # also inside the ribbon of the tile above
 
     rows_out, tiles_out, core_out = [],[],[]

@@ -15,7 +15,7 @@ def _in_stored_region(pos, spec, tile_id):
     """
     core_min = spec.core_bounds(tile_id)[:,0]
     u = np.mod(pos.astype(np.float64) - (core_min - spec.buffer_width), L)
-    return np.all(u < spec.core_size + 2 * spec.buffer_width, axis = 1)
+    return np.all(u <= spec.core_size + 2 * spec.buffer_width, axis = 1)
 
 def _chunks(arrays, size):
     def make():
@@ -169,4 +169,57 @@ def test_velocities_stored_as_float32(tmp_path):
                 assert group['vel'].dtype == np.float32
                 np.testing.assert_array_equal(
                     group['vel'][()], src['vel'][group['ID'][()]].astype(np.float32))
+
+def test_rows_exactly_on_ribbon_edge_are_stored():
+    """A row exactly buffer_width outside a core belongs to that tile's ribbon,
+    on both sides: the region loader keeps |dx| <= size/2 + padding (inclusive),
+    so the tiles must store those rows too."""
+    spec = TileSpec(boxsize = L, tiles_per_side = 2, buffer_width = 5.0,
+                    inner_cell_size = 10.0)
+    # Tile 0 has core [0, 50)^3.
+    pos = wrap_positions(np.array([
+        [55.0, 20.0, 20.0],     # 5 above the core's upper x edge
+        [95.0, 20.0, 20.0],     # 5 below the core's lower x edge (= -5, periodic)
+        [20.0, 55.0, 20.0],     # same in y
+        [20.0, 20.0, 95.0],     # same in z
+    ]), L)
+    rows, tiles, in_core = assign_to_tiles(pos, spec)
+    in_tile0 = set(rows[(tiles == 0) & ~in_core].tolist())
+    assert in_tile0 == {0, 1, 2, 3}
+
+
+def test_tile_source_loads_rows_exactly_at_padding_edge(tmp_path):
+    """BufferedTileDataSource must return the same particles as the region cut
+    |x - center| <= size/2 + padding, including rows exactly on that boundary,
+    for core cells next to a tile edge (and across the periodic wrap)."""
+    from oasis.datasource import BufferedTileDataSource
+
+    spec = TileSpec(boxsize = L, tiles_per_side = 2, buffer_width = 5.0,
+                    inner_cell_size = 10.0)
+    edge = np.array([
+        [55.0, 5.0, 5.0],       # exactly padding past global cell (4,0,0) -> region 4
+        [95.0, 5.0, 5.0],       # exactly padding past global cell (0,0,0) -> region 0
+    ])
+    rng = np.random.default_rng(1)
+    pos = np.vstack([edge, rng.uniform(0, L, (5000, 3))])
+    n = len(pos)
+    parts = dict(ID = np.arange(n, dtype = np.int64), pos = pos,
+                 vel = np.zeros((n, 3)))
+    seeds = dict(ID = np.array([0], dtype = np.int64), pos = np.array([[25.0, 25.0, 25.0]]),
+                 vel = np.zeros((1, 3)), M200b = np.array([1e12], dtype = np.float32),
+                 R200b = np.array([0.5], dtype = np.float32),
+                 Rs = np.array([0.1], dtype = np.float32))
+    build_tiles(_chunks(parts, 2000), _chunks(seeds, 1), str(tmp_path), spec,
+                particle_mass = 1.0)
+
+    source = BufferedTileDataSource(str(tmp_path / 'tile_0.hdf5'), padding = 5.0)
+    stored = wrap_positions(pos, L).astype(np.float64)
+    for region_id, edge_id in ((4, 0), (0, 1)):
+        loaded = set(source.load_particles(region_id).pid.tolist())
+        # Expected: the same inclusive cut as the mini-box loader
+        rel = np.mod(stored - source.region_center(region_id) + L / 2, L) - L / 2
+        expected = np.flatnonzero(np.all(np.abs(rel) <= 5.0 + 5.0, axis = 1))
+        assert edge_id in loaded
+        assert loaded == set(expected.tolist())
+
  
