@@ -982,9 +982,20 @@ class MiniBoxClassifier:
             df = pandas.DataFrame(results)
             self.haloes = pandas.concat([self.haloes, df], ignore_index=True)
         
-        # Sort haloes by their orbiting mass
-        self.haloes.sort_values(by='Morb', ascending=False, inplace=True, 
-                                ignore_index=True)
+        # Sort haloes by their orbiting mass. With constant particle mass, 
+        # Morb = Norb * m_p, so equal Morb is common, and the order of equal
+        # haloes decides which one claims shared particles in percolation.
+        if self.seed_tie_break == 'halo_id':
+            # Stable sort: equal Morb keep the seed processing order
+            # (decreasing M200b, then increasing Halo_ID), which does not 
+            # depend on which other seeds were loaded (padding, tiles).
+            self.haloes.sort_values(by='Morb', ascending=False, inplace=True, 
+                                ignore_index=True, kind='stable')
+        else:
+            # Reference behavior: pandas' default quicksort, whose order of 
+            # equal values depends on the rest of the table. 
+            self.haloes.sort_values(by='Morb', ascending=False, inplace=True,
+                                    ignore_index=True)
         self.orb_sidx = numpy.concatenate(self.orb_sidx) if self.orb_sidx \
             else numpy.empty(0, dtype=numpy.intp)
         self.orb_pidx = numpy.concatenate(self.orb_pidx) if self.orb_pidx \

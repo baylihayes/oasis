@@ -287,3 +287,36 @@ def test_load_order_tie_break_keeps_source_order():
 def test_invalid_tie_break_rejected():
     with pytest.raises(ValueError):
         _seed_order([0, 1, 2, 3, 4], 'alphabetical')
+
+
+def _percolation_order(rows, tie_break):
+    """Halo_IDs in the order _process_all_seeds hands them to percolation.
+
+    rows are the per-seed classification results in seed processing order;
+    the classification itself is replaced by returning those rows."""
+    clf = MiniBoxClassifier.__new__(MiniBoxClassifier)
+    clf.seed_tie_break = tie_break
+    clf.disable_tqdm = True
+    clf.n_seeds = len(rows)
+    clf._init_catalogue_dataframe()
+    clf._classify_single_seed = lambda i: rows[i]
+    clf._process_all_seeds()
+    return clf.haloes['Halo_ID'].tolist()
+
+
+def test_equal_morb_keep_seed_order_whatever_else_is_loaded():
+    """Two haloes with equal Morb (common: Morb = Norb * m_p) must enter
+    percolation in seed order (here halo 7 before halo 3), however many other
+    haloes the region holds. An unstable sort reorders such ties depending on
+    the size of the table, so the result depended on the padding."""
+    rng = np.random.default_rng(0)
+    tied = [dict(Halo_ID=7, M200b=2e13, Morb=1.68e13),
+            dict(Halo_ID=3, M200b=1e13, Morb=1.68e13)]
+    for n_other in range(0, 400, 7):
+        others = [dict(Halo_ID=100 + k, M200b=5e12, Morb=float(m))
+                  for k, m in enumerate(rng.uniform(1e12, 1e14, n_other))]
+        # Seed order: the tied pair somewhere among the other haloes
+        at = n_other // 2
+        rows = others[:at] + tied + others[at:]
+        order = _percolation_order(rows, 'halo_id')
+        assert order.index(7) < order.index(3), f"tie reordered with {n_other} others"
