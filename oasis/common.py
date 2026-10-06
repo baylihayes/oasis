@@ -4,6 +4,8 @@ from functools import partial, wraps
 from pathlib import Path
 from time import perf_counter
 from typing import Callable, Optional, Tuple, Union
+import resource
+from contextlib import contextmanager
 
 import numpy
 
@@ -465,4 +467,34 @@ def _validate_seed_data(
 
     if not (mass.size == radius.size == len(position) == len(velocity)):
         raise ValueError("All elements in seed_data must have the same length")
+
+def peak_rss_mb() -> float:
+    """Peak resident memory of this process so far, in MB (linux reports kB)."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+
+
+class StageTimer:
+    """Records wall time and peak memory for named stages.
     
+    >>> timer = StageTimer()
+    >>> with timer('load'):
+    ...     ...
+    >>> timer.stages        # {'load': {'seconds': 1.2, 'peak_rss_mb': 830.0}}
+
+    Repeated stages accumulate their time. `peak_rss_mb` is the process's
+    memory high-water mark at the end of the stage (memory peaks never go
+    down, so it is "the peak so far", not the stage's own usage).
+    
+    """
+    def __init__(self):
+        self.stages = {}
+
+    @contextmanager
+    def __call__(self, name):
+        start = perf_counter()
+        try:
+            yield
+        finally:
+            entry = self.stages.setdefault(name, {'seconds': 0.0, 'peak_rss_mb': 0.0})
+            entry['seconds'] += perf_counter() - start
+            entry['peak_rss_mb'] = max(entry['peak_rss_mb'], peak_rss_mb())

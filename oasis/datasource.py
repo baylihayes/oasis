@@ -133,10 +133,11 @@ class LegacyMiniBoxDataSource(SpatialDataSource):
 
 class BufferedTileDataSource(SpatialDataSource):
     """
-    Served the inner cells of one prebuilt core + ribbon tile (see oasis.tiles)
+    Serves the inner cells of one prebuilt core + ribbon tile (see oasis.tiles)
     
-    Regions are the tile's CORE cells, identified by their local cell ID. Each
-    region is a cell plus 'padding', read fro the cell and its neighbors with 
+    Regions are the tile's CORE cells, identified by their GLOBAL cell ID (the
+    same number a mini-box of size inner_cell_size would have), so region IDs
+    never clash between tiles. Each region is a cell plus 'padding', read from the cell and its neighbors with 
     direct slices (rows are grouped by cell, see 'cell_offset'). Ribbon cells are
     only ever read as neighbors, never processed as regions.
 
@@ -168,6 +169,9 @@ class BufferedTileDataSource(SpatialDataSource):
         self.layers = int(np.ceil(padding / self.cell_size))
         # Global index of the tile's first core cell along each axis
         self._g0 = np.rint(core_min / self.cell_size).astype(np.int64)
+        # Global cell grid: the same numbering as miniboxes of size cell_size
+        self.n_global = int(round(self.boxsize / self.cell_size))
+        self._n_core = self.m - 2 * self.ring
 
     # -- geometry --------------------------------------------------------
     def _ijk(self, cell):
@@ -177,17 +181,30 @@ class BufferedTileDataSource(SpatialDataSource):
     def region_center(self, region_id):
         """Center of a core cell in global coordinates, computed with the same 
         formula as the minibox loader: (global cell index + 0.5) * size."""
-        g = self._g0 + self._ijk(region_id) - self.ring
+        n = self.n_global
+        g = np.array([region_id % n, (region_id // n) % n, region_id // n**2])
         return (g + 0.5) * self.cell_size
 
     def region_ids(self):
-        r, m = self.ring, self.m
-        core = range(r, m - r)
-        return [i + j * m + k * m**2 for k in core for j in core for i in core]
+        """Global cell IDs of the tile's core cells, numbered like miniboxes of
+        size inner_cell_size, so region ID never clash between tiles."""
+        n, core = self.n_global, range(self._n_core)
+        gx, gy, gz = self._g0
+        return [(gx + i) + (gy + j) * n + (gz + k) * n**2 for k in core for j in core for i in core]
+
+    def _local_cell(self, region_id):
+        """Local cell index inside this tile of a global core-cell ID."""
+        n, m = self.n_global, self.m
+        g = np.array([region_id % n, (region_id // n) % n, region_id // n**2])
+        ijk = g - self._g0 + self.ring
+        if np.any(ijk < self.ring) or np.any(ijk >= m - self.ring):
+            raise ValueError(f"region {region_id} is not a core cell of {self.tile_path}")
+        return int(ijk[0] + ijk[1] * m + ijk[2] * m**2)        
 
     def region_ids_by_workload(self):
         ids = np.array(self.region_ids())
-        return ids[np.argsort(-self._n_part_per_cell[ids], kind='stable')].tolist()
+        counts = self._n_part_per_cell[[self._local_cell(r) for r in ids]]
+        return ids[np.argsort(-counts, kind='stable')].tolist()
 
     # -- reading ----------------------------------------------------------
     def _read(self, group, cell):
@@ -221,7 +238,7 @@ class BufferedTileDataSource(SpatialDataSource):
 
     def load_seeds(self, region_id):
         with h5py.File(self.tile_path, 'r') as f:
-            data, own = self._read(f['seeds'], region_id)
+            data, own = self._read(f['seeds'], self._local_cell(region_id))
         keep = self._within_padding(data['pos'], region_id)
         m200, r200, rs = self.seed_prop_names
         return SeedSet(
@@ -233,7 +250,7 @@ class BufferedTileDataSource(SpatialDataSource):
 
     def load_particles(self, region_id):
         with h5py.File(self.tile_path, 'r') as f:
-            data, _ = self._read(f['particles'], region_id)
+            data, _ = self._read(f['particles'], self._local_cell(region_id))
         keep = self._within_padding(data['pos'], region_id)
         mass = (self.particle_mass if self.particle_mass is not None 
                 else data['mass'][keep])

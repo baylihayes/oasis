@@ -2,10 +2,11 @@
 import numpy as np
 import h5py
 from scipy.spatial import cKDTree
+import json
 
 from oasis import calibration, minibox
 from oasis.catalogue import MiniBoxClassifier, run_orbiting_mass_assignment, _offset_indices, merge_catalogues
-
+from oasis.common import StageTimer
 
 
 def _write_seeds(path, boxsize, minisize, pos, ids):
@@ -203,3 +204,35 @@ def test_calibration_parallel_failure_does_not_duplicate(tmp_path, monkeypatch):
     monkeypatch.setattr(calibration, 'Pool', _PoolThatFailsAfterOneResult)
     got = calibration._select_candidate_seeds(**kwargs, n_threads=4)
     np.testing.assert_array_equal(got, expected)
+
+def test_stage_timer_accumulates():
+    timer = StageTimer()
+    for _ in range(2):
+        with timer('work'):
+            sum(range(10_000))
+    assert set(timer.stages) == {'work'}
+    assert timer.stages['work']['seconds'] > 0
+    assert timer.stages['work']['peak_rss_mb'] > 0
+
+
+def test_run_writes_timings(tmp_path):
+    """A normal run writes run_<name>/timings.json with stages and counts."""
+    path = str(tmp_path) + '/'
+    rng = np.random.default_rng(6)
+    pos = np.vstack([5.0 + rng.normal(scale = 0.15, size = (2000, 3)),
+                     rng.uniform(0, 10, (2000, 3))])
+    _write_seeds(path, 10.0, 10.0, np.array([[5.0, 5.0, 5.0]]), np.array([7]))
+    minibox.process_simulation_data(
+        save_path=path, particle_type='dm', boxsize=10.0, minisize=10.0,
+        positions=np.mod(pos, 10.0), velocities=rng.normal(scale=50.0, size=(len(pos), 3)),
+        ids=np.arange(len(pos)), mass=(1e10, 'mass'), n_threads=1)
+    calibration.calibrate(save_path=path, omega_m=0.3)
+    run_orbiting_mass_assignment(
+        load_path=path, run_name='t', min_num_part=20, boxsize=10.0, minisize=10.0,
+        padding=1.0, particle_type='dm', redshift=0.0, n_threads=1)
+    with open(path + 'run_t/timings.json') as f:
+        t = json.load(f)
+    assert {'process_regions', 'merge'} <= set(t['run_stages'])
+    assert {'load_seeds', 'load_particles', 'classification', 'percolation'} \
+        <= set(t['region_stage_totals'])
+    assert t['n_regions'] == 1 and t['n_seeds'] == 1 and t['n_particles_loaded'] == 4000    

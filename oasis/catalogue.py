@@ -10,11 +10,37 @@ from scipy.optimize import fsolve
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
-from oasis.common import G_GRAVITY, ensure_dir_exists
+from oasis.common import G_GRAVITY, ensure_dir_exists, StageTimer
 from oasis.coordinates import _periodic_displacement
-from oasis.datasource import LegacyMiniBoxDataSource, SpatialDataSource
+from oasis.datasource import (BufferedTileDataSource, LegacyMiniBoxDataSource, 
+                              SpatialDataSource)
 
 filterwarnings('ignore')
+
+import json
+
+
+def _write_timings(load_path, run_name, run_stages, region_results, n_threads):
+    """Save a timing/memory summary next to the catalogue (run_<name>/timings.json)."""
+    region_totals = {}
+    for res in region_results:
+        for name, s in res['stages'].items():
+            tot = region_totals.setdefault(name, {'seconds': 0.0, 'max_peak_rss_mb': 0.0})
+            tot['seconds'] += s['seconds']
+            tot['max_peak_rss_mb'] = max(tot['max_peak_rss_mb'], s['peak_rss_mb'])
+    summary = dict(
+        run_stages=run_stages,                 # wall time of the whole run, per step
+        region_stage_totals=region_totals,     # summed over regions (CPU-time-like)
+        n_threads=n_threads,
+        n_regions=len(region_results),
+        n_seeds=sum(r['n_seeds'] for r in region_results),
+        n_particles_loaded=sum(r['n_particles'] for r in region_results),
+        n_haloes=sum(r['n_haloes'] for r in region_results),
+        regions=sorted(region_results, key=lambda r: r['region_id']),
+    )
+    with open(load_path + f'run_{run_name}/timings.json', 'w') as f:
+        json.dump(summary, f, indent=1)
+
 
 
 class MiniBoxClassifier:
@@ -1160,22 +1186,33 @@ class MiniBoxClassifier:
         process_minibox : Wrapper function for parallel processing.
         process_all_miniboxes : Orchestrates processing across all mini-boxes.
         """
+        timer = StageTimer()
         self._make_output_dir()
-        self._load_seeds_and_filter()
+        with timer('load_seeds'):
+            self._load_seeds_and_filter()
 
-        if self._early_exit_if_no_seeds():
-            return None
-        
-        self._compute_deltac()
-        self._build_seed_tree()
-        self._load_particles()
-        self._load_calibration_parameters()
-        self._init_catalogue_dataframe()
-        self._process_all_seeds()
-        self._percolation()
-        self._save_catalogues()
-        
-        return
+        if not self._early_exit_if_no_seeds():
+            with timer('seed_setup'):
+                self._compute_deltac()
+                self._build_seed_tree()
+            with timer('load_particles'):
+                self._load_particles()
+            self._load_calibration_parameters()
+            self._init_catalogue_dataframe()
+            with timer('classification'):
+                self._process_all_seeds()
+            with timer('percolation'):
+                self._percolation()
+            with timer('save'):
+                self._save_catalogues()
+
+        return dict(
+            region_id=int(self.mini_box_id),
+            stages=timer.stages,
+            n_seeds=int(self.n_seeds),
+            n_particles=0 if self.pid_part is None else int(len(self.pid_part)),
+            n_haloes=0 if self.n_seeds == 0 else int(len(self.haloes_perc)),
+        )
 
 
 def process_minibox(i, **kwargs):
@@ -1228,8 +1265,7 @@ def process_minibox(i, **kwargs):
     process_all_miniboxes : Higher-level function that manages parallelization.
     """
     classifier = MiniBoxClassifier(mini_box_id=i, **kwargs)
-    classifier.run()
-    return
+    return classifier.run()
 
 
 def process_all_miniboxes(
@@ -1364,6 +1400,7 @@ def process_all_miniboxes(
     )
     
     # Safely handle multiprocessing falure with a fall back to a single thread.
+    results = []
     if n_threads > 1:
         # Submit the most expensive (most populated) mini-boxes first so a few
         # dense boxes do not end up running alone at the end of the run. Each
@@ -1373,7 +1410,8 @@ def process_all_miniboxes(
             with Pool(n_threads) as pool, \
                 tqdm(total=n_regions, colour="green", ncols=100,
                     desc='Generating halo catalogue') as pbar:
-                for _ in pool.imap_unordered(func, box_order):
+                for result in pool.imap_unordered(func, box_order):
+                    results.append(result)
                     pbar.update()
         except RuntimeError as e:
             # Fall back to sequential processing
@@ -1383,9 +1421,9 @@ def process_all_miniboxes(
     if n_threads == 1:
         for box_i in tqdm(region_ids, colour="green", ncols=100,
                         desc='Generating halo catalogue'):
-            func(box_i)
+            results.append(func(box_i))
 
-    return None
+    return results
 
 
 def append_dataset(group: h5py.Group, name: str, data: numpy.ndarray) -> None:
@@ -1578,6 +1616,41 @@ def merge_catalogues(
     return None
 
 
+def verify_catalogue(load_path: str, run_name: str) -> None:
+    """Integrity checks on a merged catalogue. Raises Value Error listing
+    every problem found."""
+    run = load_path + f'run_{run_name}/'
+    with h5py.File(run + 'catalogue.hdf5', 'r') as f, \
+        h5py.File(run + 'members.hdf5', 'r') as m:
+        hid, norb, nsubs = f['Halo_ID'][()], f['Norb'][()], f['NSUBS'][()]
+        lidx, ridx = f['LIDX'][()], f['RIDX'][()]
+        slidx, sridx = f['SLIDX'][()], f['SRIDX'][()]
+        n_memb = m['PID'].shape[0]
+        n_sub = m['Halo_ID'].shape[0] if 'Halo_ID' in m else 0
+    problems = []
+    if len(numpy.unique(hid)) != len(hid):
+        problems.append("duplicate Halo_ID: a halo was written by two regions")
+    if numpy.any(ridx - lidx != norb):
+        problems.append("RIDX - LIDX differs from Norb")
+    if len(hid) and (lidx[0] != 0 or ridx[-1] != n_memb
+                        or numpy.any(lidx[1:] != ridx[:-1])):
+        problems.append("particle member range are not contiguous or don't "
+                        "cover members.hdf5 exactly")
+    has_sub = slidx >= 0 
+    if numpy.any(has_sub != (sridx >= 0)):
+        problems.append("SLIDX and SRIDX disagree on which haloes have substructures")
+    if numpy.any(sridx[has_sub] - slidx[has_sub] != nsubs[has_sub]) or \
+            numpy.any(nsubs[~has_sub] != 0):
+        problems.append("SRIDX - SLIDX differs from NSUBS")
+    s, e = slidx[has_sub], sridx[has_sub]
+    if s.size and (s[0] != 0 or e[-1] != n_sub or numpy.any(s[1:] != e[:-1])):
+        problems.append("substructure member ranges are not contiguous or don't "
+                        "cover members.hdf5 exactly")
+    if problems:
+        raise ValueError(f"Catalogue run_{run_name} failed integrity checks:\n - "
+                         + "\n - ".join(problems))
+
+
 def run_orbiting_mass_assignment(
     load_path: str,
     run_name: str,
@@ -1706,25 +1779,29 @@ def run_orbiting_mass_assignment(
     merge_catalogues : Combines individual catalogs.
     MiniBoxClassifier : Core classification algorithm and data structure.
     """
-    process_all_miniboxes(
-        load_path=load_path,
-        run_name=run_name,
-        min_num_part=min_num_part,
-        boxsize=boxsize,
-        minisize=minisize,
-        padding=padding,
-        particle_type=particle_type,
-        redshift = redshift,
-        seed_prop_names=seed_prop_names,
-        fast_mass=fast_mass,
-        n_threads=n_threads,
-        data_source = data_source,
-    )
+    timer = StageTimer()
 
-    merge_catalogues(
-        load_path=load_path,
-        run_name=run_name,
-    )
+    with timer('process_regions'):
+        results = process_all_miniboxes(
+            load_path=load_path,
+            run_name=run_name,
+            min_num_part=min_num_part,
+            boxsize=boxsize,
+            minisize=minisize,
+            padding=padding,
+            particle_type=particle_type,
+            redshift = redshift,
+            seed_prop_names=seed_prop_names,
+            fast_mass=fast_mass,
+            n_threads=n_threads,
+            data_source = data_source,
+        )
+    with timer('merge'):
+        merge_catalogues(
+            load_path=load_path,
+            run_name=run_name,
+        )
+    _write_timings(load_path, run_name, timer.stages, results, n_threads)
 
     if cleanup:
         catalogues_path = load_path + f'run_{run_name}/mini_box_catalogues/'
@@ -1740,3 +1817,43 @@ def run_orbiting_mass_assignment(
         os.removedirs(mini_boxes_path)
 
     return None
+
+def run_tiled_orbiting_mass_assignment(
+    tile_paths: list[str],
+    load_path: str,
+    run_name: str,
+    min_num_part: int,
+    boxsize: float,
+    padding: float,
+    particle_type: str,
+    redshift: float,
+    seed_prop_names: tuple[str] = ('M200b', 'R200b', 'Rs'),
+    fast_mass: bool = False,
+    n_threads: int = None,
+) -> None:
+    """Run OASIS on pre-built core+ribbon tiles and merge into one catalogue.
+
+    Every core cell of every tile is processed like a mini-box and written to
+    run_<run_name>/mini_box_catalogues/<global cell ID>.hdf5. After all tiles,
+    the cell catalogues are merged once and the result is integrity-checked.
+    `load_path` must contain calibration_pars.hdf5.
+    """
+    timer = StageTimer()
+    results = []
+    for tile_path in tqdm(tile_paths, desc='Tiles', ncols=100, colour='green'):
+        source = BufferedTileDataSource(tile_path, padding=padding,
+                                        seed_prop_names=seed_prop_names)
+        if source.boxsize != boxsize:
+            raise ValueError(f"{tile_path} was built for boxsize {source.boxsize}")
+        with timer('process_regions'):
+            results += process_all_miniboxes(
+                load_path=load_path, run_name=run_name, min_num_part=min_num_part,
+                boxsize=boxsize, minisize=source.cell_size, padding=padding,
+                particle_type=particle_type, redshift=redshift,
+                seed_prop_names=seed_prop_names, fast_mass=fast_mass,
+                n_threads=n_threads, data_source=source)
+    with timer('merge'):
+        merge_catalogues(load_path=load_path, run_name=run_name)
+    with timer('verify'):
+        verify_catalogue(load_path=load_path, run_name=run_name)
+    _write_timings(load_path, run_name, timer.stages, results, n_threads)

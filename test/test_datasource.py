@@ -8,6 +8,7 @@ import pytest
 
 from oasis.calibration import calibrate
 from oasis.catalogue import MiniBoxClassifier, run_orbiting_mass_assignment
+from oasis.catalogue import (run_tiled_orbiting_mass_assignment, verify_catalogue, merge_catalogues)
 from oasis.coordinates import relative_coordinates
 from oasis.datasource import (LegacyMiniBoxDataSource, ParticleSet, SeedSet,
                               SpatialDataSource, BufferedTileDataSource)
@@ -204,9 +205,20 @@ def _matching_mini_box(tile, region):
 
 def test_tile_regions_are_core_cells(tmp_path):
     _build_tiles_from_box(_make_box(), str(tmp_path))
-    tile = _tile_sources(tmp_path)[0]
+    tiles = _tile_sources(tmp_path)
+    tile = tiles[0]
     assert len(tile.region_ids()) == (tile.m - 2 * tile.ring) ** 3   # 2x2x2 core cells
     assert sorted(tile.region_ids_by_workload()) == sorted(tile.region_ids())
+    # Region IDs are global mini-box IDs: together the tiles cover every mini-box
+    # exactly once, and each region's centre lies in the mini-box with that ID.
+    all_ids = [r for t in tiles for r in t.region_ids()]
+    assert sorted(all_ids) == list(range(int(BOX / MINI) ** 3))
+    for t in tiles:
+        for r in t.region_ids():
+            assert _matching_mini_box(t, r) == r
+    # A core cell of another tile is refused.
+    with pytest.raises(ValueError):
+        tiles[0]._local_cell(tiles[1].region_ids()[0])
 
 def test_tile_source_rejects_padding_wider_than_ribbon(tmp_path):
     _build_tiles_from_box(_make_box(), str(tmp_path))
@@ -266,3 +278,57 @@ def test_classifier_on_tiles_matches_mini_boxes(tmp_path):
                                               np.sort(b.orb_pid_perc[lo:hi]))
             n_haloes += len(a.haloes_perc)
     assert n_haloes > 0
+
+def test_tiled_run_reproduces_untiled_run(tmp_path):
+    """The whole tiled pipeline (tiles -> cells -> merge) must give exactly the
+    same catalogue and members as the normal mini-box pipeline."""
+    path = str(tmp_path) + '/'
+    d = _make_box()
+    _write_box(path, d)
+    _build_tiles_from_box(d, path + 'tiles')
+    calibrate(save_path=path, omega_m=0.3)
+    common = dict(load_path=path, min_num_part=10, boxsize=BOX, padding=PAD,
+                  particle_type='dm', redshift=0.0, n_threads=1)
+    run_orbiting_mass_assignment(run_name='untiled', minisize=MINI, **common)
+    run_tiled_orbiting_mass_assignment(
+        tile_paths=[path + f'tiles/tile_{t}.hdf5' for t in range(TILE_SPEC.n_tiles)],
+        run_name='tiled', **common)
+    verify_catalogue(path, 'untiled')
+  # The catalogue must be identical, including row order and index ranges.
+    with h5py.File(path + 'run_untiled/catalogue.hdf5') as a, \
+            h5py.File(path + 'run_tiled/catalogue.hdf5') as b:
+        assert set(a.keys()) == set(b.keys())
+        assert len(a['Halo_ID']) > 0
+        for key in a:
+            np.testing.assert_array_equal(a[key][()], b[key][()])
+        lidx, ridx = a['LIDX'][()], a['RIDX'][()]
+    # Every halo must have the same members. The order WITHIN a halo follows the
+    # order particles were loaded (mini-box files vs tile cells), which is not
+    # science, so members are compared per halo as sets.
+    with h5py.File(path + 'run_untiled/members.hdf5') as a, \
+            h5py.File(path + 'run_tiled/members.hdf5') as b:
+        assert set(a.keys()) == set(b.keys())
+        pa, pb = a['PID'][()], b['PID'][()]
+        assert len(pa) == len(pb)
+        for lo, hi in zip(lidx, ridx):
+            np.testing.assert_array_equal(np.sort(pa[lo:hi]), np.sort(pb[lo:hi]))
+        if 'Halo_ID' in a:
+            np.testing.assert_array_equal(a['Halo_ID'][()], b['Halo_ID'][()])
+
+
+def test_verify_catalogue_detects_duplicate_halo(tmp_path):
+    """A halo written by two regions must be reported."""
+    load_path = str(tmp_path) + '/'
+    cat_dir = tmp_path / 'run_t' / 'mini_box_catalogues'
+    cat_dir.mkdir(parents=True)
+    for name in ('0.hdf5', '1.hdf5'):               # same Halo_ID 0 in both files
+        with h5py.File(cat_dir / name, 'w') as hdf:
+            for key, val, dt in (('Halo_ID', [0], np.int64), ('Norb', [2], np.uint32),
+                                 ('LIDX', [0], np.uint32), ('RIDX', [2], np.uint32),
+                                 ('NSUBS', [0], np.uint32), ('PID', [-1], np.int64),
+                                 ('SLIDX', [0], np.uint32), ('SRIDX', [0], np.uint32)):
+                hdf.create_dataset(f'halo/{key}', data=val, dtype=dt)
+            hdf.create_dataset('memb/PID', data=[1, 2], dtype=np.uint32)
+    merge_catalogues(load_path=load_path, run_name='t')
+    with pytest.raises(ValueError, match="duplicate Halo_ID"):
+        verify_catalogue(load_path, 't')
