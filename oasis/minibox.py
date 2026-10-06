@@ -313,6 +313,8 @@ def split_simulation_into_mini_boxes(
     - Each mini-box is saved as '{mini_box_id}.hdf5'
     - Memory usage is optimized by processing particles in chunks
     - Progress bars show completion status for ID computation and file saving
+    - Positions are wrapped into [0, boxsize); positions that would round up
+      to boxsize when stored as float32 are stored as 0 (periodically the same)
 
     Examples
     --------
@@ -639,8 +641,9 @@ def load_particles(
         If load_path is not a directory.
     OSError
         If HDF5 files cannot be read or are corrupted.
-    RuntimeError
-        If loaded data is inconsistent or if no particles are found.
+    ValueError
+        If the mini-box and its neighbours contain no rows at all. (If rows
+        exist but none lie within the padding, empty arrays are returned.)
 
     See Also
     --------
@@ -808,8 +811,9 @@ def load_seeds(
         If load_path is not a directory.
     OSError
         If HDF5 files cannot be read or are corrupted.
-    RuntimeError
-        If loaded data is inconsistent or if no particles are found.
+    ValueError
+        If the mini-box and its neighbours contain no rows at all. (If rows
+        exist but none lie within the padding, empty arrays are returned.)
 
     See Also
     --------

@@ -19,6 +19,22 @@ import numpy as np
 
 @dataclass(frozen=True)
 class TileSpec:
+    """Geometry of the core + ribbon tiling.
+
+    The box is split into tiles_per_side**3 cubic cores of size
+    boxsize / tiles_per_side. Each tile also stores a ribbon of width
+    buffer_width around its core. Inside a tile, rows are grouped into cubic
+    inner cells of size inner_cell_size; `ring` extra cells per side hold the
+    ribbon.
+
+    Raises
+    ------
+    ValueError
+        If buffer_width < 0, if the ribbon is so wide that a tile would overlap
+        itself across the periodic boundary, or if inner_cell_size does not
+        divide the core size.
+    """
+
     boxsize: float          #global periodic box size, e.g. 1000.0
     tiles_per_side: int     # e.g. 5 -> 125 tiles
     buffer_width: float     # ribbon width w
@@ -146,12 +162,19 @@ ChunkFactory = Callable[[], Iterator[dict]]     # returns a new iterator each ca
 def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
                       kind: str) -> np.ndarray:
     """
-    Stream input chunks into one unsorted bucket files per tile.
+    Stream input chunks into one unsorted bucket file per tile.
     
     Each chunk is a dict of equal-length arrays and must contain 'pos'. 
     make_chunks() is called twice: first to count rows per tile, then to write
     them into preallocated datasets. Returns the number of rows per tile.
     
+    Raises
+    ------
+    ValueError
+        If make_chunks() yields no chunks.
+    RuntimeError
+        If the input changes between the two passes.
+
     """
     counts = np.zeros(spec.n_tiles, dtype = np.int64)
     fields = None
@@ -210,8 +233,14 @@ def build_tile(bucket_path: str, tile_path: str, tile_id: int, spec: TileSpec,
                attrs: dict | None = None) -> None:
     """
     Group one tile's bucket rows by inner cell into group 'kind' of the tile
-    file, with cell_offset[c]:cell_offset[c+1] giving the rows cell c.
-    
+    file, with cell_offset[c]:cell_offset[c+1] giving the rows of cell c.
+
+    rows_per_block limits how many bucket rows are held in memory at once.
+
+    Raises
+    ------
+    FileExistsError
+        If the tile file already contains a group named 'kind'.
     """
     m3 = spec.cells_per_side**3 
     with h5py.File(bucket_path, 'r') as src, h5py.File(tile_path, 'a') as dst:
@@ -265,8 +294,36 @@ def build_tiles(make_particle_chunks: ChunkFactory, make_seed_chunks: ChunkFacto
 
     Refuses to run if out_dir already contains tile or bucket files, unless
     overwrite = True, in which case only those files are deleted first.
-    
+
+    Parameters
+    ----------
+    make_particle_chunks, make_seed_chunks : callable
+        Called with no arguments; each call must return a NEW iterator over
+        chunks (each input is read twice). A chunk is a dict of equal-length
+        arrays with at least 'ID', 'pos' (n, 3) and 'vel' (n, 3); seed chunks
+        also need the seed properties (e.g. 'M200b', 'R200b', 'Rs'). Positions
+        are wrapped into the box and stored as float32, velocities as float32;
+        other columns keep their dtype.
+    out_dir : str
+        Folder for the tile files (created if needed).
+    spec : TileSpec
+        Tiling geometry.
+    particle_mass : float, optional
+        Constant particle mass, stored in the tile metadata. If None, particle
+        chunks must contain a per-particle 'mass' column.
+    keep_buckets : bool, default=False
+        Keep the intermediate bucket files (for debugging).
+    overwrite : bool, default=False
+        Delete existing tile/bucket files in out_dir first.
+
+    Raises
+    ------
+    FileExistsError
+        If out_dir already contains tile or bucket files and overwrite is False.
+    ValueError
+        If a chunk factory yields no chunks.
     """
+
     existing = sorted(glob.glob(os.path.join(out_dir, 'tile_*.hdf5'))+
                       glob.glob(os.path.join(out_dir, 'bucket_*.hdf5')))
     if existing:

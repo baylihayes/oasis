@@ -204,20 +204,21 @@ def _get_candidate_seed_particle_data(
     particle_type : str
         Particle type identifier within each HDF5 file. Valid names are 'dm', 
         'gas' and 'star'. Default is 'dm' for same-mass objects.
-    particle_mass : Union[float, numpy.ndarray]
-        Mass of each simulation particle. Must be positive.
     mass_density : float
         Mean matter density of the universe. Must be positive.
+    redshift : float
+        Redshift of the snapshot. Particle velocities are stored as
+        v_phys / sqrt(a) and are converted before use.
 
     Returns
     -------
     numpy.ndarray
-        Particle data array with shape (n_particles, 3) where each row contains:
-        - Column 0: r/R200m - Radial distance scaled by R200m
-        - Column 1: vr/V200m - Radial velocity scaled by V200m  
-        - Column 2: ln(v^2/V200m^2) - Natural log of velocity squared scaled by V200m^2
+        Particle data array with shape (3, n_particles):
+        - Row 0: r/R200m - Radial distance scaled by R200m
+        - Row 1: vr/V200m - Radial velocity scaled by V200m  
+        - Row 2: ln(v^2/V200m^2) - Natural log of velocity squared scaled by V200m^2
 
-        If no valid particles are found, returns empty array with shape (0, 3).
+        If no valid particles are found, returns empty array with shape (3, 0).
 
     Raises
     ------
@@ -246,6 +247,9 @@ def _get_candidate_seed_particle_data(
     - Uses periodic boundary conditions when computing relative coordinates
     - R200m is defined as the radius where mean enclosed density equals 200*rhom
     - V200m = \sqrt(G*M200m/R200m) where M200m is the mass within R200m
+    - Particles are selected in a cube of half-side r_max around each seed,
+      using a periodic KD-tree built once per mini-box (same particles, same
+      order as masking all particles)
     - Memory usage scales with the number of particles within r_max of all seeds
 
     Examples
@@ -2828,10 +2832,6 @@ def calibrate(
             raise ValueError("Omega_m out of bounds.")
         
         # Positive radial velocity
-        # slope_pos = -2.17603504 + 1.03114681 * (omega_m - 0.3)
-        # b_pivot_pos = 1.83532578
-
-        # slope_pos = -2.174666 + 1.435353 * (omega_m - 0.3)
         slope_pos = -1.9029634573662748 + 0.4347721236533314 * numpy.log(omega_m / 0.5)
         b_pivot_pos = 1.808536
 

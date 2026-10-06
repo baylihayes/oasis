@@ -2,8 +2,8 @@
 Data sources that supply seeds and particles to the OASIS classifier.
 
 The classifier only needs arrays for one region (a minibox plus padding).
-A data source hides where those arrays come from (minibox files currently, 
-pre-buffered large tiles later), so the science stays the same. 
+A data source hides where those arrays come from (minibox files or prebuilt
+core + ribbon tiles), so the science stays the same.
 """
 
 from abc import ABC, abstractmethod
@@ -141,6 +141,23 @@ class BufferedTileDataSource(SpatialDataSource):
     direct slices (rows are grouped by cell, see 'cell_offset'). Ribbon cells are
     only ever read as neighbors, never processed as regions.
 
+    Parameters
+    ----------
+    tile_path : str
+        Tile file written by oasis.tiles.build_tiles().
+    padding : float, default=5.0
+        Distance around each core cell to load. Must not exceed the tile's
+        ribbon width (buffer_width).
+    seed_prop_names : tuple of str, default=('M200b', 'R200b', 'Rs')
+        Mass, radius and scale radius dataset names in the 'seeds' group.
+
+    The particle mass is read from the tile metadata (as float32, like the
+    minibox files); if absent, a per-particle 'mass' dataset is used.
+
+    Raises
+    ------
+    ValueError
+        If padding is larger than the tile's buffer_width.
     """
 
     def __init__(self, tile_path, padding = 5.0,

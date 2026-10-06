@@ -45,9 +45,37 @@ def _write_timings(load_path, run_name, run_stages, region_results, n_threads):
 
 class MiniBoxClassifier:
     """
-    Parallel-friendly wrapper for classify_single_mini_box().
-    Each instance handles exactly == one mini box ==.
+    Runs OASIS on one region (a mini-box, or a core cell of a tile): load
+    seeds and particles, classify, percolate, and save the region's catalogue.
+
+    Parameters
+    ----------
+    Same as process_all_miniboxes(), plus:
+
+    mini_box_id : int
+        ID of the region to process: a mini-box ID for mini-box files, or a
+        global inner-cell ID for tiles.
+    data_source : SpatialDataSource, optional
+        Where seeds and particles are read from. If None, a
+        LegacyMiniBoxDataSource is built from load_path, boxsize, minisize,
+        particle_type, seed_prop_names and padding, i.e. the mini-box files
+        written by process_simulation_data(). Its boxsize must equal boxsize.
+    seed_tie_break : {'halo_id', 'load_order'}, default='halo_id'
+        Order for seeds with exactly equal M200b. Seeds are processed from most
+        to least massive, and the first one processed gets first claim on
+        shared particles, so this order can change the catalogue.
+        'halo_id' orders ties by increasing Halo_ID, which makes the result
+        independent of how the data is stored (mini-box size, file order,
+        tiles). 'load_order' keeps the order returned by the data source; with
+        mini-box files this reproduces the reference code exactly.
+
+    Raises
+    ------
+    ValueError
+        If data_source.boxsize differs from boxsize, or seed_tie_break is not
+        'halo_id' or 'load_order'.
     """
+
 
     def __init__(
         self,
@@ -125,6 +153,15 @@ class MiniBoxClassifier:
         ensure_dir_exists(self.save_path)
 
     def _load_seeds_and_filter(self):
+        """Load the seeds for this region from the data source and sort them.
+
+        Seeds are sorted by decreasing M200b, with ties broken according to
+        `self.seed_tie_break` (Halo_ID or load order). With fast_mass, seeds
+        lighter than 5 times the lightest seed are dropped. Sets the seed
+        attributes (pos_seed, vel_seed, hid, r200b, m200b, rs, mask_mb) and
+        n_seeds; if there are no seeds, only n_seeds = 0 is set.
+        """
+
         seeds = self.data_source.load_seeds(self.mini_box_id)
 
         # Nothing else to do if there are no seeds around this mini-box.
@@ -280,6 +317,13 @@ class MiniBoxClassifier:
         return frac1 - frac2
 
     def _load_particles(self):
+        """Load the particles for this region (core plus padding) from the data source.
+
+        Velocities are converted from simulation units (v_phys / sqrt(a)) to
+        physical. Builds the periodic particle KD-tree (self.position_tree)
+        used by _classify_particles and _particles_in_6d_ball.
+        """
+
         particles = self.data_source.load_particles(self.mini_box_id)
         self.pos_part = particles.pos
         self.vel_part = particles.vel
@@ -304,6 +348,13 @@ class MiniBoxClassifier:
             )
 
     def _init_catalogue_dataframe(self):
+        """Create empty catalogue tables and the member lists filled during classification.
+
+        Members are stored as local indices into the loaded particle and seed
+        arrays (orb_pidx, orb_sidx), not as IDs; they are converted to IDs when
+        saving. orb_mass is only filled for variable-mass particles.
+        """
+
         col_names = (
             "Halo_ID",
             "pos",
@@ -701,7 +752,27 @@ class MiniBoxClassifier:
         particles returned by a spatial query of the particle KD-tree are
         evaluated. The query radius is enlarged by `self._search_margin` and
         the original cut is applied afterwards, so the result is identical.
+
+        Parameters
+        ----------
+        within_r200b : numpy.ndarray
+            Sorted indices into the loaded particles: the parent halo's
+            candidate particles.
+        center_pos, center_vel : numpy.ndarray
+            Position and (physical) velocity of the substructure seed, shape (3,).
+        r_ball : float
+            Radius of the ball. NaN returns no particles; inf keeps every
+            particle in within_r200b that passes the velocity cut.
+        v_ball_sq : float
+            Squared velocity radius of the ball.
+
+        Returns
+        -------
+        numpy.ndarray
+            Positions in within_r200b (not particle indices) of the particles
+            inside the ball, in increasing order.
         """
+
         r_ball_sq = r_ball**2
         if numpy.isnan(r_ball_sq):
             return numpy.empty(0, dtype=numpy.intp)
@@ -1083,8 +1154,9 @@ class MiniBoxClassifier:
         /halo/ group:
             - Halo_ID, pos, vel, R200b, M200b, Morb, Norb, LIDX, RIDX, NSUBS,
             PID, SLIDX, SRIDX
-            - Data types are optimized (e.g., uint32 for indices, float32 for
-            physical quantities)
+            - Halo_ID and PID are stored as int64, physical quantities as float32,
+            counts and per-file indices as uint32 (merge_catalogues widens the
+            indices to int64)
             - The INMB column is excluded as all halos satisfy this criterion
             after percolation
 
@@ -1159,11 +1231,18 @@ class MiniBoxClassifier:
 
         Returns
         -------
-        None
-            Produces side effects:
+        dict
+            Summary of this region, used for timings.json:
+            - region_id : int, the region processed
+            - stages : dict, wall time and peak memory per stage
+            - n_seeds : int, seeds loaded for the region
+            - n_particles : int, particles loaded (0 if no seeds)
+            - n_haloes : int, haloes written (0 if no seeds)
+            Also produces side effects:
             - Creates output directory structure
             - Writes HDF5 catalog file to disk
             - Modifies instance attributes throughout execution
+
 
         Notes
         -----
@@ -1244,13 +1323,15 @@ def process_minibox(i, **kwargs):
     **kwargs : dict
         Keyword arguments forwarded to MiniBoxClassifier constructor.
         Required keys: min_num_part, boxsize, minisize, load_path, run_name,
-        particle_type. Optional keys: padding, fast_mass, disable_tqdm.
+        particle_type, seed_prop_names, redshift. Optional keys: padding,
+        fast_mass, disable_tqdm, data_source, seed_tie_break.
 
     Returns
     -------
-    None
-        Produces side effects via MiniBoxClassifier.run(), writing catalog
-        files to disk.
+    dict
+        The summary returned by MiniBoxClassifier.run(). Catalogue files are
+        written to disk as a side effect.
+
 
     Notes
     -----
@@ -1297,13 +1378,12 @@ def process_all_miniboxes(
     n_threads: int = None,
     data_source: SpatialDataSource | None = None,
     seed_tie_break: str = 'halo_id',
-) -> None:
+) -> list[dict]:
     """Process all mini-boxes in parallel to generate individual halo catalogs.
 
-    This function divides the simulation volume into mini-boxes and processes
-    each in parallel using multiprocessing. It automatically handles thread
-    management and falls back to sequential processing if parallel execution
-    fails.
+    This function processes every region of the data source (mini-boxes, or
+    the core cells of one tile) in parallel using multiprocessing, or one by
+    one if n_threads is 1. If a worker fails, its error is raised.
 
     Parameters
     ----------
@@ -1336,24 +1416,37 @@ def process_all_miniboxes(
     n_threads : int, optional
         Number of parallel workers. If None, uses half of available CPU cores,
         capped at the number of mini-boxes.
+    data_source : SpatialDataSource, optional
+        Where seeds and particles are read from. If None, the mini-box files in
+        load_path are used (LegacyMiniBoxDataSource). The regions processed are
+        data_source.region_ids(): mini-boxes, or the core cells of one tile.
+    seed_tie_break : {'halo_id', 'load_order'}, default='halo_id'
+        Order for seeds with exactly equal M200b; see MiniBoxClassifier.
+        'halo_id' gives the same catalogue for any data layout; 'load_order'
+        reproduces the reference code.
+ 
 
     Returns
     -------
-    None
-        Produces side effects:
+    list of dict
+        One summary per region (see MiniBoxClassifier.run()), in completion
+        order. Also produces side effects:
         - Creates output directory structure
-        - Writes individual HDF5 catalog files for each mini-box
+        - Writes individual HDF5 catalog files for each region
         - Displays progress bars during execution
+
 
     Notes
     -----
-    The function automatically computes the number of mini-boxes as
-    ceil(boxsize/minisize)^3.
+    The regions processed are data_source.region_ids(): all
+    ceil(boxsize/minisize)^3 mini-boxes for mini-box files, or the core cells
+    of one tile for a BufferedTileDataSource.
 
     Thread management:
-    - Default: min(cpu_count/2, n_mini_boxes)
+    - Default: min(cpu_count/2, number_of_resions)
     - Capped at total number of mini-boxes to avoid idle workers
-    - Falls back to sequential processing if multiprocessing fails
+    - If a worker fails, its error is raised; there is no sequential fallback
+
 
     Each mini-box produces an independent catalog file that must be merged
     using merge_catalogues() to create the final unified catalog.
@@ -1416,26 +1509,23 @@ def process_all_miniboxes(
         seed_tie_break = seed_tie_break,
     )
     
-    # Safely handle multiprocessing falure with a fall back to a single thread.
+    # Run regions in parallel, or one by one if n_threads == 1.
     results = []
     if n_threads > 1:
         # Submit the most expensive (most populated) mini-boxes first so a few
         # dense boxes do not end up running alone at the end of the run. Each
         # mini-box is independent, so the order does not change the output.
         box_order = data_source.region_ids_by_workload()
-        try:
-            with Pool(n_threads) as pool, \
-                tqdm(total=n_regions, colour="green", ncols=100,
-                    desc='Generating halo catalogue') as pbar:
-                for result in pool.imap_unordered(func, box_order):
-                    results.append(result)
-                    pbar.update()
-        except RuntimeError as e:
-            # Fall back to sequential processing
-            n_threads = 1
-            raise RuntimeError(e)
-    
-    if n_threads == 1:
+        # If a worker fails, the error is raised here; there is no sequential
+        # fallback (a failing region would usually fail again, and rerunning
+        # every region on one core is too slow for large runs).
+        with Pool(n_threads) as pool, \
+            tqdm(total=n_regions, colour="green", ncols=100,
+                desc='Generating halo catalogue') as pbar:
+            for result in pool.imap_unordered(func, box_order):
+                results.append(result)
+                pbar.update()
+    else:
         for box_i in tqdm(region_ids, colour="green", ncols=100,
                         desc='Generating halo catalogue'):
             results.append(func(box_i))
@@ -1514,6 +1604,10 @@ def merge_catalogues(
         - Indices (LIDX, RIDX, SLIDX, SRIDX) are offset to account for
           concatenation across mini-boxes
         - Halos without substructures have SLIDX=SRIDX=-1
+        - LIDX, RIDX, SLIDX and SRIDX are written as int64, so merged indices cannot
+          overflow for large catalogues. The same merge is used for tiled runs, where
+          the files are named by global cell ID instead of mini-box ID.
+
 
     members.hdf5:
         - PID: Concatenated particle IDs for all orbiting particles
@@ -1529,11 +1623,9 @@ def merge_catalogues(
 
     Examples
     --------
-    >>> n_boxes = int(np.ceil(100.0 / 25.0))**3  # 64 mini-boxes
     >>> merge_catalogues(
     ...     load_path='/data/simulation/',
-    ...     run_name='production_v1',
-    ...     n_mini_boxes=n_boxes
+    ...     run_name='production_v1'
     ... )
 
     See Also
@@ -1634,8 +1726,19 @@ def merge_catalogues(
 
 
 def verify_catalogue(load_path: str, run_name: str) -> None:
-    """Integrity checks on a merged catalogue. Raises Value Error listing
-    every problem found."""
+    """Check a merged catalogue for integrity problems.
+
+    Checks that Halo_IDs are unique (no halo written by two regions), that
+    RIDX - LIDX equals Norb and SRIDX - SLIDX equals NSUBS, that SLIDX and
+    SRIDX agree on which haloes have substructure, and that the particle and
+    substructure member ranges are contiguous and cover members.hdf5 exactly.
+
+    Raises
+    ------
+    ValueError
+        Listing every problem found.
+    """
+
     run = load_path + f'run_{run_name}/'
     with h5py.File(run + 'catalogue.hdf5', 'r') as f, \
         h5py.File(run + 'members.hdf5', 'r') as m:
@@ -1727,11 +1830,19 @@ def run_orbiting_mass_assignment(
         performance. May miss low-mass halos near the resolution limit.
     n_threads : int, optional
         Number of parallel workers for mini-box processing. If None,
-        automatically determined as min(cpu_count/2, n_mini_boxes).
+        automatically determined as min(cpu_count/2, number_of_regions).
     cleanup : bool | str, default=False
         If True, delete individual mini-box catalog files after merging to
         save disk space. Final catalogs are retained. Also removes the mini-box
         directory if set to 'all'.
+    data_source : SpatialDataSource, optional
+        Where seeds and particles are read from. If None, the mini-box files in
+        load_path are used. For tiled runs use
+        run_tiled_orbiting_mass_assignment() instead.
+    seed_tie_break : {'halo_id', 'load_order'}, default='halo_id'
+        Order for seeds with exactly equal M200b; see MiniBoxClassifier.
+        Use 'load_order' only to reproduce the reference code exactly.
+ 
 
     Returns
     -------
@@ -1857,7 +1968,54 @@ def run_tiled_orbiting_mass_assignment(
     run_<run_name>/mini_box_catalogues/<global cell ID>.hdf5. After all tiles,
     the cell catalogues are merged once and the result is integrity-checked.
     `load_path` must contain calibration_pars.hdf5.
+
+    Parameters
+    ----------
+    tile_paths : list of str
+        Tile files written by oasis.tiles.build_tiles(). Together they must
+        cover the whole box; each tile's core cells are processed once.
+    load_path : str
+        Directory containing calibration_pars.hdf5. Outputs are written to
+        load_path/run_<run_name>/. Must end with '/'.
+    run_name : str
+        Identifier for this run.
+    min_num_part : int
+        Minimum number of orbiting particles required to classify a seed
+        as a halo.
+    boxsize : float
+        Size of the full periodic box. Must match the boxsize of every tile.
+    padding : float
+        Distance around each core cell from which particles are loaded. Must
+        not exceed the tiles' ribbon width (buffer_width).
+    particle_type : str
+        Type of particles (e.g. 'dm'), as for run_orbiting_mass_assignment().
+    redshift : float
+        Redshift of simulation.
+    seed_prop_names : Tuple[str], optional
+        Mass, radius and scale radius names in the tile 'seeds' group.
+        Default is ('M200b', 'R200b', 'Rs').
+    fast_mass : bool, default=False
+        As for run_orbiting_mass_assignment().
+    n_threads : int, optional
+        Number of parallel workers per tile. If None, half the CPU cores,
+        capped at the number of core cells in a tile.
+    seed_tie_break : {'halo_id', 'load_order'}, default='halo_id'
+        Order for seeds with exactly equal M200b; see MiniBoxClassifier.
+        Keep 'halo_id' when comparing with an untiled run: with 'load_order'
+        the result depends on how seeds are stored in the tiles.
+
+    Returns
+    -------
+    None
+        Writes run_<run_name>/catalogue.hdf5, members.hdf5 and timings.json.
+
+    Raises
+    ------
+    ValueError
+        If a tile was built for a different boxsize, or padding exceeds a
+        tile's ribbon width.
     """
+
     timer = StageTimer()
     results = []
     for tile_path in tqdm(tile_paths, desc='Tiles', ncols=100, colour='green'):
