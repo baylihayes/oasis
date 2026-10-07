@@ -10,7 +10,6 @@ import os
 from dataclasses import dataclass
 from itertools import product
 from typing import Callable, Iterator
-import glob
 
 import h5py
 import numpy as np
@@ -160,13 +159,15 @@ def local_cell_ids(pos: np.ndarray, tile_id: int, spec: TileSpec) -> np.ndarray:
 ChunkFactory = Callable[[], Iterator[dict]]     # returns a new iterator each call
 
 def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
-                      kind: str) -> np.ndarray:
+                      kind: str, tile_ids = None) -> np.ndarray:
     """
     Stream input chunks into one unsorted bucket file per tile.
     
     Each chunk is a dict of equal-length arrays and must contain 'pos'. 
     make_chunks() is called twice: first to count rows per tile, then to write
     them into preallocated datasets. Returns the number of rows per tile.
+    Only the tiles in tile_ids (default: all) get a bucket file; the counts returned
+    are for all tiles. 
     
     Raises
     ------
@@ -176,6 +177,11 @@ def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
         If the input changes between the two passes.
 
     """
+    tile_ids = (np.arange(spec.n_tiles) if tile_ids is None
+                else np.unique(np.asarray(tile_ids, dtype = np.int64)))
+    wanted = np.zeros(spec.n_tiles, dtype = bool)
+    wanted[tile_ids] = True
+
     counts = np.zeros(spec.n_tiles, dtype = np.int64)
     fields = None
     for chunk in make_chunks():         # pass 1: count
@@ -193,16 +199,16 @@ def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
                          "Check input path.")
 
     os.makedirs(out_dir, exist_ok = True)
-    files = [h5py.File(os.path.join(out_dir, f'bucket_{kind}_{t}.hdf5'), 'w')
-            for t in range(spec.n_tiles)]
+    files = {t: h5py.File(os.path.join(out_dir, f'bucket_{kind}_{t}.hdf5'), 'w')
+             for t in tile_ids.tolist()}
     
     try: 
-        dsets = []
-        for t, f in enumerate(files):
+        dsets = {}
+        for t, f in files.items():
             d = {k: f.create_dataset(k, shape=(counts[t],) + tail, dtype = dt)
                  for k, (dt, tail) in fields.items()}
             d['in_core'] = f.create_dataset('in_core', shape=(counts[t],), dtype = bool)
-            dsets.append(d)
+            dsets[t] = d
 
         cursor = np.zeros(spec.n_tiles, dtype = np.int64)
         for chunk in make_chunks():                 # pass 2: write
@@ -210,6 +216,8 @@ def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
             if 'vel' in chunk:
                 chunk['vel'] = np.asarray(chunk['vel'], dtype = np.float32)
             rows, tiles, in_core = assign_to_tiles(chunk['pos'], spec)
+            keep = wanted[tiles]
+            rows, tiles, in_core = rows[keep], tiles[keep], in_core[keep]
             order = np.argsort(tiles, kind = 'stable')
             rows, tiles, in_core = rows[order], tiles[order], in_core[order]
             bounds = np.searchsorted(tiles, np.arange(spec.n_tiles + 1))
@@ -220,10 +228,10 @@ def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
                     dsets[t][k][c0:c0 + r.size] = np.asarray(chunk[k])[r]
                 dsets[t]['in_core'][c0:c0 + r.size] = in_core[sel]
                 cursor[t] += r.size
-        if not np.array_equal(cursor, counts):
+        if not np.array_equal(cursor[tile_ids], counts[tile_ids]):
             raise RuntimeError("input changed between the two passes.")
     finally:
-        for f in files:
+        for f in files.values():
             f.close()
     return counts
 
@@ -287,13 +295,15 @@ def build_tile(bucket_path: str, tile_path: str, tile_id: int, spec: TileSpec,
 
 def build_tiles(make_particle_chunks: ChunkFactory, make_seed_chunks: ChunkFactory, 
                 out_dir: str, spec: TileSpec, particle_mass: float | None = None,
-                keep_buckets: bool = False, overwrite: bool = False) -> None:
+                keep_buckets: bool = False, overwrite: bool = False,
+                tile_ids = None) -> None:
     """
-    Build all tile files: out_dir/tile_<id>.hdf5 with groups 'particles'
-    and 'seeds' and a 'tile_metadata' group.
-
-    Refuses to run if out_dir already contains tile or bucket files, unless
-    overwrite = True, in which case only those files are deleted first.
+    Builds the tiles in tile_ids (default: all), so a large box can be built in groups
+    of tiles: each call reads the whole input twice, but bucket files (as large as the 
+    tiles themselves) exist only for the tiles being built. Refuses to run if any
+    of this call's tile or bucket files already exist, unless overwrite = True, in 
+    which case only those files are deleted first. Tiles of other calls in the same
+    out_dir are left alone.
 
     Parameters
     ----------
@@ -314,18 +324,30 @@ def build_tiles(make_particle_chunks: ChunkFactory, make_seed_chunks: ChunkFacto
     keep_buckets : bool, default=False
         Keep the intermediate bucket files (for debugging).
     overwrite : bool, default=False
-        Delete existing tile/bucket files in out_dir first.
+        Delete this call's existing tile/bucket files in out_dir first.
+    tile_ids : iterable of int, optional
+        Tiles to build (0 <= id < spec.n_tiles). Default: all tiles. 
 
     Raises
     ------
     FileExistsError
-        If out_dir already contains tile or bucket files and overwrite is False.
+        If any of this call's tile or bucket files already exist and
+        overwrite is False.
     ValueError
         If a chunk factory yields no chunks.
+    ValueError
+        If a tile ID is outside 0 <= id < spec.n_tiles.
     """
+    tile_ids = (list(range(spec.n_tiles)) if tile_ids is None
+                else sorted({int(t) for t in tile_ids}))
+    if any(t < 0 or t >= spec.n_tiles for t in tile_ids):
+        raise ValueError(f"tile_ids must be between 0 and {spec.n_tiles - 1}.")
 
-    existing = sorted(glob.glob(os.path.join(out_dir, 'tile_*.hdf5'))+
-                      glob.glob(os.path.join(out_dir, 'bucket_*.hdf5')))
+    mine = [os.path.join(out_dir, name) for t in tile_ids
+            for name in (f'tile_{t}.hdf5', f'bucket_particles_{t}.hdf5',
+                         f'bucket_seeds_{t}.hdf5')]
+
+    existing = [p for p in mine if os.path.exists(p)]
     if existing:
         if not overwrite: 
             raise FileExistsError(
@@ -336,10 +358,10 @@ def build_tiles(make_particle_chunks: ChunkFactory, make_seed_chunks: ChunkFacto
             os.remove(path)
 
 
-    bucket_into_tiles(make_particle_chunks, out_dir, spec, 'particles')
-    bucket_into_tiles(make_seed_chunks, out_dir, spec, 'seeds')
+    bucket_into_tiles(make_particle_chunks, out_dir, spec, 'particles', tile_ids)
+    bucket_into_tiles(make_seed_chunks, out_dir, spec, 'seeds', tile_ids)
     attrs = {} if particle_mass is None else {'particle_mass': particle_mass}
-    for t in range(spec.n_tiles):
+    for t in tile_ids:
         tile_path = os.path.join(out_dir, f'tile_{t}.hdf5')
         for kind in ('particles', 'seeds'):
             bucket = os.path.join(out_dir, f'bucket_{kind}_{t}.hdf5')

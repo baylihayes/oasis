@@ -223,3 +223,78 @@ def test_tile_source_loads_rows_exactly_at_padding_edge(tmp_path):
         assert loaded == set(expected.tolist())
 
  
+
+def _read_tile_files(out_dir, tile_ids):
+    """All datasets and metadata of the given tiles, keyed by (tile, group, name)."""
+    out = {}
+    for t in tile_ids:
+        with h5py.File(out_dir / f'tile_{t}.hdf5') as f:
+            for kind in ('particles', 'seeds'):
+                for name, ds in f[kind].items():
+                    out[(t, kind, name)] = ds[()]
+            for name, value in f['tile_metadata'].attrs.items():
+                out[(t, 'tile_metadata', name)] = np.asarray(value)
+    return out
+
+
+def _assert_same(a, b):
+    assert a.keys() == b.keys()
+    for key in a:
+        np.testing.assert_array_equal(a[key], b[key], err_msg=str(key))
+        assert a[key].dtype == b[key].dtype, key
+
+
+def test_single_tile_equals_tile_from_full_build(tmp_path):
+    """A tile built on its own is identical to the same tile from a full
+    build: same rows in the same order, same cell offsets and metadata."""
+    spec = TileSpec(boxsize=L, tiles_per_side=2, buffer_width=5.0, inner_cell_size=10.0)
+    parts, seeds = _make_inputs()
+    build_tiles(_chunks(parts, 1000), _chunks(seeds, 50), str(tmp_path / 'all'), spec,
+                particle_mass=1e10)
+    build_tiles(_chunks(parts, 1000), _chunks(seeds, 50), str(tmp_path / 'one'), spec,
+                particle_mass=1e10, tile_ids=[5])
+
+    assert sorted(p.name for p in (tmp_path / 'one').iterdir()) == ['tile_5.hdf5']
+    _assert_same(_read_tile_files(tmp_path / 'one', [5]),
+                 _read_tile_files(tmp_path / 'all', [5]))
+
+
+def test_building_in_groups_equals_one_call(tmp_path):
+    """Building the tiles in several calls into one folder gives the same
+    files as one call, and a call does not touch the tiles of other calls."""
+    spec = TileSpec(boxsize=L, tiles_per_side=2, buffer_width=5.0, inner_cell_size=10.0)
+    parts, seeds = _make_inputs()
+    build_tiles(_chunks(parts, 1000), _chunks(seeds, 50), str(tmp_path / 'all'), spec)
+    for group in ([0, 1, 2], [7, 3], [4, 6, 5]):     # any order, any grouping
+        build_tiles(_chunks(parts, 1000), _chunks(seeds, 50), str(tmp_path / 'groups'),
+                    spec, tile_ids=group)
+
+    tiles = range(spec.n_tiles)
+    _assert_same(_read_tile_files(tmp_path / 'groups', tiles),
+                 _read_tile_files(tmp_path / 'all', tiles))
+    assert not list((tmp_path / 'groups').glob('bucket_*'))
+
+
+def test_existing_tiles_of_other_calls_do_not_block(tmp_path):
+    """Only this call's own tile files make it refuse (without overwrite)."""
+    spec = TileSpec(boxsize=L, tiles_per_side=2, buffer_width=5.0, inner_cell_size=10.0)
+    parts, seeds = _make_inputs()
+    args = (_chunks(parts, 1000), _chunks(seeds, 50), str(tmp_path), spec)
+    build_tiles(*args, tile_ids=[0])
+    before = _read_tile_files(tmp_path, [0])
+
+    build_tiles(*args, tile_ids=[1])                 # different tile: allowed
+    with pytest.raises(FileExistsError):
+        build_tiles(*args, tile_ids=[1, 2])          # tile 1 exists: refused
+    assert not (tmp_path / 'tile_2.hdf5').exists()   # nothing written
+    _assert_same(_read_tile_files(tmp_path, [0]), before)
+
+
+@pytest.mark.parametrize("bad", [[-1], [8], [0, 8]])
+def test_invalid_tile_ids_rejected(tmp_path, bad):
+    spec = TileSpec(boxsize=L, tiles_per_side=2, buffer_width=5.0, inner_cell_size=10.0)
+    parts, seeds = _make_inputs()
+    with pytest.raises(ValueError, match="tile_ids"):
+        build_tiles(_chunks(parts, 1000), _chunks(seeds, 50), str(tmp_path), spec,
+                    tile_ids=bad)
+    assert not list(tmp_path.iterdir())              # nothing written
