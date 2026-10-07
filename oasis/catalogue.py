@@ -2,6 +2,11 @@ import os
 from functools import partial
 from multiprocessing import Pool
 from warnings import filterwarnings
+import hashlib
+import json
+import socket
+import subprocess
+import time
 
 import h5py
 import numpy
@@ -17,7 +22,6 @@ from oasis.datasource import (BufferedTileDataSource, LegacyMiniBoxDataSource,
 
 filterwarnings('ignore')
 
-import json
 
 
 def _write_timings(load_path, run_name, run_stages, region_results, n_threads):
@@ -1990,6 +1994,11 @@ def run_tiled_orbiting_mass_assignment(
     the cell catalogues are merged once and the result is integrity-checked.
     `load_path` must contain calibration_pars.hdf5.
 
+    Each tile is processed by process_tile, which skips tiles already
+    finished, so after an interruption the same call resumes where it
+    stopped; merge_tiled_run then merges, verifies and writes manifest.json.
+
+
     Parameters
     ----------
     tile_paths : list of str
@@ -2037,23 +2046,245 @@ def run_tiled_orbiting_mass_assignment(
         If a tile was built for a different boxsize, or padding exceeds a
         tile's ribbon width.
     """
+    for tile_path in tqdm(tile_paths, desc='Tiles', ncols = 100, colour = 'green'):
+        process_tile(tile_path, load_path=load_path, run_name=run_name, 
+                      min_num_part=min_num_part, boxsize=boxsize, padding=padding,
+                      particle_type=particle_type, redshift=redshift, 
+                      seed_prop_names=seed_prop_names, fast_mass=fast_mass,
+                      n_threads=n_threads, seed_tie_break=seed_tie_break)
+    merge_tiled_run(load_path=load_path, run_name=run_name)
+
+
+# ============================================================================
+# Tiled production runs: one restartable job per tile, then one global merge.
+# ============================================================================
+def _sha256(path: str) -> str:
+    """SHA-256 of a file, to record exactly which calibration a run used."""
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _tiled_run_settings(tile_path, load_path, min_num_part, boxsize, padding,
+                        particle_type, redshift, seed_prop_names, fast_mass,
+                        seed_tie_break):
+    """Tile ID, and everything that must be identical for all tiles of one run."""
+    with h5py.File(tile_path,'r') as f:
+        meta = f['tile_metadata'].attrs
+        tiling = dict(global_boxsize=float(meta['global_boxsize']),
+                      tiles_per_side=int(meta['tiles_per_side']),
+                      buffer_width=float(meta['buffer_width']),
+                      inner_cell_size=float(meta['inner_cell_size']))
+        tile_id = int(meta['tile_id'])
+    settings = dict(min_num_part=int(min_num_part), boxsize=float(boxsize),
+                    padding=float(padding), particle_type=particle_type,
+                    redshift=float(redshift), seed_prop_names=list(seed_prop_names),
+                    fast_mass=bool(fast_mass), seed_tie_break=seed_tie_break,
+                    calibration_sha256=_sha256(load_path + 'calibration_pars.hdf5'),
+                    tiling=tiling)
+    return tile_id, settings
+
+
+def _write_json_atomic(path:str, data: dict) -> None:
+    """Write JSON so that a reader never sees a half-written file."""
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+def process_tile(
+        tile_path: str,
+        load_path: str,
+        run_name: str,
+        min_num_part: int,
+        boxsize: float,
+        padding:float,
+        particle_type: str,
+        redshift: float,
+        seed_prop_names: tuple[str] = ('M200b', 'R200b', 'Rs'),
+        fast_mass: bool = False,
+        n_threads: int = None,
+        seed_tie_break: str = 'halo_id',
+        redo: bool = False,
+) -> dict:
+    """Process every core cell of one tile; safe to rerun after a failure.
+    
+    Writes the cell catalogues to run_<run_name>/tiles_done/tile_<id>.json
+    with the run settings, the tile's cells and its timings. A tile with a 
+    marker is skipped (unless redo=True), so a run can be restarted and only 
+    unfinished tiles are processed. Leftover cell files of the tiles from an
+    interrupted attempt are deleted first, so they cannot reach the merge.
+    
+    Parameters are those of run_tiled_orbiting_mass_assignment, for one tile,
+    plus redo (default False): process the tile again even if it is finished.
+    
+    Returns
+    -------
+    dict
+        The marker contents.
+        
+    Raises
+    ------
+    ValueError
+        If the tile was built for another boxsize, or it was already processed
+        with different settings (padding, calibration file, tiling, ...).
+    """
+    run_dir = load_path + f'run_{run_name}/'
+    done_dir = run_dir + 'tiles_done/'
+    cell_dir = run_dir + 'mini_box_catalogues/'
+    tile_id, settings = _tiled_run_settings(
+        tile_path, load_path, min_num_part, boxsize, padding, particle_type,
+        redshift, seed_prop_names, fast_mass, seed_tie_break)
+    marker = done_dir + f'tile_{tile_id}.json'
+
+    if os.path.exists(marker) and not redo:
+        with open(marker) as f:
+            done = json.load(f)
+        if done['settings'] != settings:
+            raise ValueError(
+                f"tile {tile_id} was already processed for run '{run_name}' with "
+                f"different settings; use another run_name or redo = True.")
+        return done
+
+    source = BufferedTileDataSource(tile_path, padding=padding,
+                                    seed_prop_names=seed_prop_names)
+    if source.boxsize != boxsize:
+        raise ValueError(f"{tile_path} was built for boxsize {source.boxsize}")
+    region_ids = [int(r) for r in source.region_ids()]
+
+    # Remove this tile's marker and cell files form any earlier attempt: a cell
+    # that now has no haloes writes no file, so an old file would survive.
+    ensure_dir_exists(done_dir)
+    if os.path.exists(marker):
+        os.remove(marker)
+    for r in region_ids:
+        if os.path.exists(cell_dir + f'{r}.hdf5'):
+            os.remove(cell_dir + f'{r}.hdf5')
 
     timer = StageTimer()
-    results = []
-    for tile_path in tqdm(tile_paths, desc='Tiles', ncols=100, colour='green'):
-        source = BufferedTileDataSource(tile_path, padding=padding,
-                                        seed_prop_names=seed_prop_names)
-        if source.boxsize != boxsize:
-            raise ValueError(f"{tile_path} was built for boxsize {source.boxsize}")
-        with timer('process_regions'):
-            results += process_all_miniboxes(
-                load_path=load_path, run_name=run_name, min_num_part=min_num_part,
-                boxsize=boxsize, minisize=source.cell_size, padding=padding,
-                particle_type=particle_type, redshift=redshift,
-                seed_prop_names=seed_prop_names, fast_mass=fast_mass,
-                n_threads=n_threads, data_source=source, seed_tie_break=seed_tie_break)
+    with timer('process_regions'):
+        results = process_all_miniboxes(
+            load_path=load_path, run_name=run_name, min_num_part=min_num_part, 
+            boxsize=boxsize, minisize=source.cell_size, padding=padding,
+            particle_type=particle_type, redshift=redshift,
+            seed_prop_names=seed_prop_names, fast_mass=fast_mass,
+            n_threads=n_threads, data_source=source, seed_tie_break=seed_tie_break)
+
+    done = dict(tile_id=tile_id, tile_path=os.path.abspath(tile_path),
+                settings=settings, region_ids=region_ids,
+                n_haloes=sum(r['n_haloes'] for r in results),
+                stages=timer.stages, n_threads=n_threads,
+                regions=sorted(results, key=lambda r: r['region_id']),
+                host=socket.gethostname(),
+                finished=time.strftime('%Y-%m-%dT%H:%M:%S'))
+    _write_json_atomic(marker, done)
+    return done
+
+
+def merge_tiled_run(load_path: str, run_name: str, partial: bool = False) -> dict:
+    """Merge a tiled run, verify it, write the manifest.
+
+    Requires a marker (from process_tile) for every tile of the tiling, unless
+    partial=True, all with identical settings, and no cell catalogue that does
+    not belong to a finished tile. Then merges the cell catalogues into
+    catalogue.hdf5 and members.hdf5, runs verify_catalogue, and writes
+    timings.json and manifest.json (settings, OASIS commit, per-tile summary,
+    totals).
+
+    Parameters
+    ----------
+    load_path : str
+        Directory containing calibration_pars.hdf5 and run_<run_name>/.
+    run_name : str
+        Identifier of the run.
+    partial : bool, default=False
+        Merge only the finished tiles (e.g. a single test tile). The catalogue
+        then holds exactly the haloes of those tiles' cores, and the manifest
+        records partial=True and the missing tiles.
+
+    Returns
+    -------
+    dict
+        The manifest.
+
+    Raises
+    ------
+    RuntimeError
+        If tiles are missing (and partial is False), settings differ between 
+        tiles, or there are cell catalogues that no finished tile produced.
+    ValueError
+        If the merged catalogue fails verify_catalogue.
+    """
+    run_dir = load_path + f'run_{run_name}/'
+    done_dir = run_dir + 'tiles_done/'
+    cell_dir = run_dir + 'mini_box_catalogues/'
+
+    markers = []
+    if os.path.isdir(done_dir):
+        for name in sorted(os.listdir(done_dir)):
+            if name.startswith('tile_') and name.endswith('.json'):
+                with open(done_dir + name) as f:
+                    markers.append(json.load(f))
+    if not markers:
+        raise RuntimeError(f"no finished tiles in {done_dir}")
+
+    settings = markers[0]['settings']
+    if any(m['settings'] != settings for m in markers):
+        raise RuntimeError("tiles of this run were processed with different "
+                           "settings; reprocess them with one set of settings.")
+    n_tiles = settings['tiling']['tiles_per_side'] ** 3
+    missing = sorted(set(range(n_tiles)) - {m['tile_id'] for m in markers})
+    if missing and not partial:
+        raise RuntimeError(f"{len(missing)} of {n_tiles} tiles not finished: {missing}"
+                           " (use partial=True to merge only the finished tiles)")
+
+    expected = {r for m in markers for r in m['region_ids']}
+    present = {int(os.path.splitext(n)[0]) for n in os.listdir(cell_dir)
+               if n.endswith('.hdf5') and os.path.splitext(n)[0].isdigit()} \
+        if os.path.isdir(cell_dir) else set()
+    stray = sorted(present - expected)
+    if stray:
+        raise RuntimeError(f"{len(stray)} cell catalogues do not belong to any "
+                           f"finished tile, e.g. {stray[:10]}")
+
+    timer = StageTimer()
     with timer('merge'):
         merge_catalogues(load_path=load_path, run_name=run_name)
     with timer('verify'):
         verify_catalogue(load_path=load_path, run_name=run_name)
-    _write_timings(load_path, run_name, timer.stages, results, n_threads)
+
+    results = [r for m in markers for r in m['regions']]
+    _write_timings(load_path, run_name, timer.stages, results, markers[0]['n_threads'])
+
+    with h5py.File(run_dir + 'catalogue.hdf5', 'r') as f:
+        n_haloes = int(f['Halo_ID'].shape[0])
+        n_subhaloes = int((f['PID'][()] != -1).sum())
+    with h5py.File(run_dir + 'members.hdf5', 'r') as f:
+        n_particle_members = int(f['PID'].shape[0])
+    try:
+        commit = subprocess.run(
+            ['git', '-C', os.path.dirname(os.path.abspath(__file__)), 'rev-parse', 'HEAD'],
+            capture_output=True, text=True, check=True).stdout.strip()
+        dirty = bool(subprocess.run(
+            ['git', '-C', os.path.dirname(os.path.abspath(__file__)), 'status',
+             '--porcelain', '--untracked-files=no'],
+            capture_output=True, text=True, check=True).stdout.strip())
+    except (OSError, subprocess.CalledProcessError):
+        commit, dirty = None, None
+    manifest = dict(
+        run_name=run_name, oasis_commit=commit, oasis_uncommitted_changes=dirty,
+        settings=settings, merged=time.strftime('%Y-%m-%dT%H:%M:%S'), merge_stages=timer.stages,
+        n_tiles=n_tiles, n_regions=len(expected), n_haloes=n_haloes,
+        n_subhaloes=n_subhaloes, n_particle_members=n_particle_members,
+        partial=bool(missing), tiles_missing=missing, verify='passed',
+        tiles=[dict(tile_id=m['tile_id'], tile_path=m['tile_path'],
+                    n_regions=len(m['region_ids']), n_haloes=m['n_haloes'],
+                    seconds=m['stages']['process_regions']['seconds'],
+                    peak_rss_mb=m['stages']['process_regions']['peak_rss_mb'],
+                    host=m['host'], finished=m['finished'])
+               for m in sorted(markers, key=lambda m: m['tile_id'])])
+    _write_json_atomic(run_dir + 'manifest.json', manifest)
+    return manifest
