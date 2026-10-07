@@ -94,6 +94,11 @@ def wrap_positions(pos: np.ndarray, boxsize: float) -> np.ndarray:
     round up to the boxsize in float32 become 0 (same rules as the minibox writer).
     
     """
+    pos = np.asarray(pos)
+    # Fast path: float32 input already inside [0, boxsize) is returned as is;
+    # the general path would not change such values.
+    if pos.dtype == np.float32 and pos.size and pos.min() >= 0 and pos.max() < boxsize:
+        return pos
     pos = np.mod(np.asarray(pos, dtype=np.float64), boxsize)
     pos[pos.astype(np.float32).astype(np.float64) >= boxsize] = 0.0
     return pos.astype(np.float32)
@@ -118,22 +123,33 @@ def assign_to_tiles(pos: np.ndarray, spec: TileSpec):
     lo = t <= w              # also inside the ribbon of the tile below
     hi = t >= core - w      # also inside the ribbon of the tile above
 
-    rows_out, tiles_out, core_out = [],[],[]
-    for off in product((-1,0,1), repeat = 3):
-        mask = np.ones(len(x), dtype = bool)
+    # Every row is in its own core; only rows near a core face can also be in
+    # a ribbon, so the 26 ribbon offsets are tested on those rows only. Pairs
+    # come out in the same order as testing every offset on every row.
+    near = np.flatnonzero(np.any(lo | hi, axis=1))
+    lo_n, hi_n, i0_n = lo[near], hi[near], i0[near]
+    core_tile = i0[:, 0] + i0[:, 1] * n + i0[:, 2] * n**2
+    rows_out, tiles_out, core_out = [], [], []
+    for off in product((-1, 0, 1), repeat=3):
+        if off == (0, 0, 0):
+            rows_out.append(np.arange(len(x), dtype=np.int64))
+            tiles_out.append(core_tile)
+            core_out.append(np.ones(len(x), dtype=bool))
+            continue
+        mask = np.ones(len(near), dtype=bool)
         for axis, o in enumerate(off):
             if o == -1:
-                mask &= lo[:, axis]
+                mask &= lo_n[:, axis]
             elif o == 1:
-                mask &= hi[:, axis]
-        rows = np.flatnonzero(mask)
-        if rows.size == 0:
+                mask &= hi_n[:, axis]
+        if not mask.any():
             continue
-        ijk = (i0[rows] + np.array(off)) % n                # periodic wrap
+        rows = near[mask]
+        ijk = (i0_n[mask] + np.array(off)) % n                # periodic wrap
         rows_out.append(rows)
-        tiles_out.append(ijk[:,0] + ijk[:,1] * n + ijk[:,2] * n**2)
-        core_out.append(np.full(rows.size, off == (0,0,0)))
-    return (np.concatenate(rows_out), np.concatenate(tiles_out), 
+        tiles_out.append(ijk[:, 0] + ijk[:, 1] * n + ijk[:, 2] * n**2)
+        core_out.append(np.zeros(rows.size, dtype=bool))
+    return (np.concatenate(rows_out), np.concatenate(tiles_out),
             np.concatenate(core_out))
 
 def local_cell_ids(pos: np.ndarray, tile_id: int, spec: TileSpec) -> np.ndarray:
@@ -158,6 +174,34 @@ def local_cell_ids(pos: np.ndarray, tile_id: int, spec: TileSpec) -> np.ndarray:
 # Stage 1
 ChunkFactory = Callable[[], Iterator[dict]]     # returns a new iterator each call
 
+def _candidate_rows(pos: np.ndarray, spec: TileSpec, wanted: np.ndarray):
+    """
+    Rows that may lie in the core or ribbon of a wanted tile, or None if every
+    row may (all tiles wanted along every axis).
+
+    A cheap, conservative pre-filter (it may keep extra rows, never drops a needed
+    one): per axis, a row is kept if its coordinate is within buffer_width, plus one
+    lookup bin of margin, of the core of some wanted tile along that axis. 
+    assign_to_tiles then decides exactly.
+    """
+    n, core, w, L = (spec.tiles_per_side, spec.core_size, spec.buffer_width,
+                     spec.boxsize)
+    nb = 64 * n                         # lookup bins per axis
+    g = L / nb                          # bin width; nb * g == L, so bins wrap exactly
+    idx = spec.tile_index(np.flatnonzero(wanted))
+    keep = None
+    for axis in range(3):
+        allowed = np.zeros(nb, dtype = bool)
+        for k in np.unique(idx[axis]):
+            first = int(np.floor((k * core - w) / g)) - 1
+            last = int(np.floor(((k + 1) * core + w) / g)) + 1
+            allowed[np.arange(first, last + 1) % nb] = True
+        if allowed.all():
+            continue
+        b = np.minimum((pos[:, axis] * np.float32(1.0 / g)).astype(np.int64), nb - 1)
+        keep = allowed[b] if keep is None else keep & allowed[b]
+    return None if keep is None else np.flatnonzero(keep)
+
 def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
                       kind: str, tile_ids = None) -> np.ndarray:
     """
@@ -166,8 +210,9 @@ def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
     Each chunk is a dict of equal-length arrays and must contain 'pos'. 
     make_chunks() is called twice: first to count rows per tile, then to write
     them into preallocated datasets. Returns the number of rows per tile.
-    Only the tiles in tile_ids (default: all) get a bucket file; the counts returned
-    are for all tiles. 
+    Only the tiles in tile_ids (default: all) get a bucket file, and rows that
+    cannot reach them are skipped early; the counts returned are complete only
+    for those tiles.
     
     Raises
     ------
@@ -185,7 +230,9 @@ def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
     counts = np.zeros(spec.n_tiles, dtype = np.int64)
     fields = None
     for chunk in make_chunks():         # pass 1: count
-        _, tiles, _ = assign_to_tiles(wrap_positions(chunk['pos'], spec.boxsize), spec)
+        pos = wrap_positions(chunk['pos'], spec.boxsize)
+        cand = _candidate_rows(pos, spec, wanted)
+        _, tiles, _ = assign_to_tiles(pos if cand is None else pos[cand], spec)
         counts += np.bincount(tiles, minlength=spec.n_tiles)
         if fields is None:
             fields = {k: (np.asarray(v).dtype, np.shape(v)[1:])
@@ -215,7 +262,12 @@ def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
             chunk = dict(chunk, pos = wrap_positions(chunk['pos'], spec.boxsize))
             if 'vel' in chunk:
                 chunk['vel'] = np.asarray(chunk['vel'], dtype = np.float32)
-            rows, tiles, in_core = assign_to_tiles(chunk['pos'], spec)
+            cand = _candidate_rows(chunk['pos'], spec, wanted)
+            if cand is None:
+                rows, tiles, in_core = assign_to_tiles(chunk['pos'], spec)
+            else: 
+                rows, tiles, in_core = assign_to_tiles(chunk['pos'][cand], spec)
+                rows = cand[rows]
             keep = wanted[tiles]
             rows, tiles, in_core = rows[keep], tiles[keep], in_core[keep]
             order = np.argsort(tiles, kind = 'stable')

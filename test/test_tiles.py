@@ -298,3 +298,83 @@ def test_invalid_tile_ids_rejected(tmp_path, bad):
         build_tiles(_chunks(parts, 1000), _chunks(seeds, 50), str(tmp_path), spec,
                     tile_ids=bad)
     assert not list(tmp_path.iterdir())              # nothing written
+
+
+def _assign_to_tiles_reference(pos, spec):
+    """The original assign_to_tiles: every offset tested on every row. Kept
+    here to pin the exact output (pairs, order and dtypes) of the faster
+    version, which tests the 26 ribbon offsets on rows near a core face only."""
+    from itertools import product
+    n, core, w = spec.tiles_per_side, spec.core_size, spec.buffer_width
+    x = np.asarray(pos, dtype=np.float64)
+    i0 = np.minimum((x // core).astype(np.int64), n - 1)
+    t = x - i0 * core
+    lo, hi = t <= w, t >= core - w
+    rows_out, tiles_out, core_out = [], [], []
+    for off in product((-1, 0, 1), repeat=3):
+        mask = np.ones(len(x), dtype=bool)
+        for axis, o in enumerate(off):
+            if o == -1:
+                mask &= lo[:, axis]
+            elif o == 1:
+                mask &= hi[:, axis]
+        rows = np.flatnonzero(mask)
+        if rows.size == 0:
+            continue
+        ijk = (i0[rows] + np.array(off)) % n
+        rows_out.append(rows)
+        tiles_out.append(ijk[:, 0] + ijk[:, 1] * n + ijk[:, 2] * n**2)
+        core_out.append(np.full(rows.size, off == (0, 0, 0)))
+    return (np.concatenate(rows_out), np.concatenate(tiles_out),
+            np.concatenate(core_out))
+
+
+_SPECS = [dict(boxsize=1000.0, tiles_per_side=5, buffer_width=7.5, inner_cell_size=25.0),
+          dict(boxsize=L, tiles_per_side=2, buffer_width=5.0, inner_cell_size=10.0),
+          dict(boxsize=L, tiles_per_side=4, buffer_width=5.0, inner_cell_size=5.0),
+          dict(boxsize=L, tiles_per_side=3, buffer_width=10.0, inner_cell_size=L / 6)]
+
+
+def _test_positions(spec, rng, n=50000):
+    """Random rows plus rows exactly on every core edge and ribbon edge."""
+    c, w, box = spec.core_size, spec.buffer_width, spec.boxsize
+    edges = np.mod([v for k in range(spec.tiles_per_side + 1)
+                    for v in (k * c - w, k * c + w, k * c, (k + 1) * c - w)], box)
+    grid = np.array(np.meshgrid(edges, edges, edges)).reshape(3, -1).T
+    return wrap_positions(np.vstack([rng.uniform(0, box, (n, 3)), grid]), box)
+
+
+@pytest.mark.parametrize("kw", _SPECS)
+def test_assign_to_tiles_matches_reference_exactly(kw):
+    """Same (row, tile, in_core) triples in the same order and dtypes as the
+    original implementation, so tile files stay byte-for-byte identical."""
+    spec = TileSpec(**kw)
+    pos = _test_positions(spec, np.random.default_rng(5))
+    for got, ref in zip(assign_to_tiles(pos, spec), _assign_to_tiles_reference(pos, spec)):
+        assert got.dtype == ref.dtype
+        np.testing.assert_array_equal(got, ref)
+
+
+@pytest.mark.parametrize("kw", _SPECS)
+def test_candidate_rows_never_drop_a_needed_row(kw):
+    """The pre-filter may keep extra rows but must keep every row that lies in
+    the core or ribbon of a wanted tile, for any set of wanted tiles."""
+    from oasis.tiles import _candidate_rows
+    spec = TileSpec(**kw)
+    rng = np.random.default_rng(6)
+    pos = _test_positions(spec, rng)
+    rows, tiles, _ = assign_to_tiles(pos, spec)
+    for _ in range(25):
+        wanted = np.zeros(spec.n_tiles, dtype=bool)
+        wanted[rng.choice(spec.n_tiles, rng.integers(1, spec.n_tiles + 1),
+                          replace=False)] = True
+        cand = _candidate_rows(pos, spec, wanted)
+        if cand is None:                     # nothing filtered: trivially safe
+            continue
+        needed = np.unique(rows[wanted[tiles]])
+        assert np.isin(needed, cand).all()
+    # A single tile keeps only a small fraction of a large box (the speed-up).
+    if spec.tiles_per_side == 5:
+        one = np.zeros(spec.n_tiles, dtype=bool)
+        one[0] = True
+        assert len(_candidate_rows(pos, spec, one)) < 0.05 * len(pos)
