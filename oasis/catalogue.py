@@ -61,13 +61,20 @@ class MiniBoxClassifier:
         particle_type, seed_prop_names and padding, i.e. the mini-box files
         written by process_simulation_data(). Its boxsize must equal boxsize.
     seed_tie_break : {'halo_id', 'load_order'}, default='halo_id'
-        Order for seeds with exactly equal M200b. Seeds are processed from most
-        to least massive, and the first one processed gets first claim on
-        shared particles, so this order can change the catalogue.
-        'halo_id' orders ties by increasing Halo_ID, which makes the result
-        independent of how the data is stored (mini-box size, file order,
-        tiles). 'load_order' keeps the order returned by the data source; with
-        mini-box files this reproduces the reference code exactly.
+        How ties are broken in the two places where the processing order
+        decides which halo gets first claim on shared particles:
+        - seeds with exactly equal M200b, which are classified from most to
+          least massive;
+        - haloes with exactly equal Morb, which enter percolation from most to
+          least massive (with constant particle mass, Morb = Norb * m_p, so
+          equal Morb is common).
+        'halo_id' orders equal M200b by increasing Halo_ID and keeps equal Morb
+        in that seed order (stable sort), which makes the result independent
+        of how the data is stored and of how much is loaded around each
+        region (mini-box size, file order, tiles, padding). 'load_order' keeps
+        the order returned by the data source and pandas' default (unstable)
+        sort for Morb; with mini-box files this reproduces the reference code
+        exactly.
 
     Raises
     ------
@@ -123,10 +130,13 @@ class MiniBoxClassifier:
             )
         self.data_source = data_source
 
-        # How seeds with exactly equal M200b are ordered for processing:
-        # 'halo_id'    - by increasing Halo_ID, independent of how the data is
-        #                stored (tiles, mini-box size, file order). Default.
-        # 'load_order' - in the order the data source returns them; reproduces
+        # How ties are ordered where the processing order matters (seeds with
+        # equal M200b, and haloes with equal Morb entering percolation):
+        # 'halo_id'    - equal M200b by increasing Halo_ID, equal Morb kept in
+        #                that seed order. Independent of how the data is stored
+        #                and how much is loaded (tiles, mini-box size, padding).
+        #                Default.
+        # 'load_order' - data-source order and pandas' default sort; reproduces
         #                the reference code exactly (used for regression checks).
         if seed_tie_break not in ('halo_id', 'load_order'):
             raise ValueError(f"seed_tie_break must be 'halo_id' or 'load_order', "
@@ -1432,9 +1442,9 @@ def process_all_miniboxes(
         load_path are used (LegacyMiniBoxDataSource). The regions processed are
         data_source.region_ids(): mini-boxes, or the core cells of one tile.
     seed_tie_break : {'halo_id', 'load_order'}, default='halo_id'
-        Order for seeds with exactly equal M200b; see MiniBoxClassifier.
-        'halo_id' gives the same catalogue for any data layout; 'load_order'
-        reproduces the reference code.
+        How ties in M200b (seed order) and in Morb (percolation order) are
+        broken; see MiniBoxClassifier. Use 'load_order' only to reproduce the
+        reference code exactly.
  
 
     Returns
@@ -1851,9 +1861,9 @@ def run_orbiting_mass_assignment(
         load_path are used. For tiled runs use
         run_tiled_orbiting_mass_assignment() instead.
     seed_tie_break : {'halo_id', 'load_order'}, default='halo_id'
-        Order for seeds with exactly equal M200b; see MiniBoxClassifier.
-        Use 'load_order' only to reproduce the reference code exactly.
- 
+        How ties in M200b (seed order) and in Morb (percolation order) are
+        broken; see MiniBoxClassifier. Use 'load_order' only to reproduce the
+        reference code exactly.
 
     Returns
     -------
@@ -2011,9 +2021,10 @@ def run_tiled_orbiting_mass_assignment(
         Number of parallel workers per tile. If None, half the CPU cores,
         capped at the number of core cells in a tile.
     seed_tie_break : {'halo_id', 'load_order'}, default='halo_id'
-        Order for seeds with exactly equal M200b; see MiniBoxClassifier.
-        Keep 'halo_id' when comparing with an untiled run: with 'load_order'
-        the result depends on how seeds are stored in the tiles.
+        How ties in M200b (seed order) and in Morb (percolation order) are
+        broken; see MiniBoxClassifier. Keep 'halo_id' when comparing with an
+        untiled run: with 'load_order' the result depends on how seeds are
+        stored in the tiles.
 
     Returns
     -------
