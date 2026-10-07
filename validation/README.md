@@ -2,7 +2,7 @@
 
 Tools to check that the current OASIS code still reproduces the reference
 version (`oasis-reference` tag, the code before the MDPL2 refactor), and that
-the tiled pipeline reproduces the normal mini-box pipeline. See plan §15.2–15.3.
+the tiled pipeline reproduces the normal mini-box pipeline.
 
 ## Quick start
 
@@ -40,7 +40,7 @@ Run it after every change to the `oasis` package, before committing.
 | `run_pipeline.py` | Runs one OASIS version end to end on a box: mini-box split, self-calibration data, catalogue (optionally tiled with `--tiles N`). |
 | `compare_runs.py` | Compares two runs, halo by halo, and prints a verdict. |
 | `run_regression.sh` | All of the above in one command. |
-| `padding_convergence.py` | Runs one box with increasing padding (= ribbon width) and reports which haloes still change (plan §6, §15.4, Milestone E.2). |
+| `padding_convergence.py` | Runs one box with increasing padding (= ribbon width) and reports which haloes still change. |
 
 ## What the box contains
 
@@ -67,8 +67,8 @@ Each check prints `OK`, `ACCEPTED` or `FAIL`:
 
 | Difference | Reason |
 |---|---|
-| `Morb` within 1e-6 relative | The reference summed N float32 copies of the particle mass; the current code computes N × m_p directly (Milestone B). |
-| `Halo_ID`, `PID`, `LIDX`, `RIDX`, `SLIDX`, `SRIDX` stored as int64 | 32-bit types would overflow for MDPL2-sized catalogues (fixes 1–2). Values are identical. |
+| `Morb` within 1e-6 relative | The reference summed N float32 copies of the particle mass; the current code computes N × m_p directly. |
+| `Halo_ID`, `PID`, `LIDX`, `RIDX`, `SLIDX`, `SRIDX` stored as int64 | 32-bit types would overflow for MDPL2-sized catalogues. Values are identical. |
 | `LIDX`/`RIDX`/`SLIDX`/`SRIDX` values not compared | The reference merged mini-box files in filesystem order, so member positions differ. The members of every halo are compared instead. |
 | `memb/Halo_ID` integer instead of float64 | The reference produced float64 by accident (concatenating empty lists). Values are identical. |
 
