@@ -41,6 +41,7 @@ Run it after every change to the `oasis` package, before committing.
 | `compare_runs.py` | Compares two runs, halo by halo, and prints a verdict. |
 | `run_regression.sh` | All of the above in one command. |
 | `padding_convergence.py` | Runs one box with increasing padding (= ribbon width) and reports which haloes still change. |
+| `tile_build_benchmark.py` | Builds core + ribbon tiles from a real snapshot in bounded chunks (all tiles, chosen tiles, or groups of tiles), records time, peak memory, rows and bytes per tile and the duplication factor, and checks that every particle and seed is in exactly one core. |
 
 ## What the box contains
 
