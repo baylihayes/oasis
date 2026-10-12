@@ -11,7 +11,7 @@ import time
 import h5py
 import numpy
 import pandas
-from scipy.optimize import fsolve
+from scipy.optimize import brentq, fsolve
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
@@ -79,12 +79,20 @@ class MiniBoxClassifier:
         the order returned by the data source and pandas' default (unstable)
         sort for Morb; with mini-box files this reproduces the reference code
         exactly.
+    ball_radius_solver : {'fsolve', 'brentq'}, default='fsolve'
+        How the 6D-ball radius (where the host's and the substructure's NFW
+        densities are equal) is found. 'fsolve' is the original solver,
+        started at half the seed separation; it can step below zero and
+        diverge to a huge negative radius, which makes the ball cover every
+        host particle (common around massive clusters). 'brentq' brackets the
+        root, which is unique between the two seeds, and always finds it.
 
     Raises
     ------
     ValueError
-        If data_source.boxsize differs from boxsize, or seed_tie_break is not
-        'halo_id' or 'load_order'.
+        If data_source.boxsize differs from boxsize, seed_tie_break is not
+        'halo_id' or 'load_order', or ball_radius_solver is not 'fsolve' or
+        'brentq'.
     """
 
 
@@ -104,6 +112,7 @@ class MiniBoxClassifier:
         disable_tqdm: bool = True,
         data_source: SpatialDataSource | None = None,
         seed_tie_break: str = 'halo_id',
+        ball_radius_solver: str = 'fsolve',
     ):
         # Input parameters
         self.mini_box_id = mini_box_id
@@ -146,6 +155,11 @@ class MiniBoxClassifier:
             raise ValueError(f"seed_tie_break must be 'halo_id' or 'load_order', "
                              f"got {seed_tie_break!r}")
         self.seed_tie_break = seed_tie_break
+
+        if ball_radius_solver not in ('fsolve', 'brentq'):
+            raise ValueError(f"ball_radius_solver must be 'fsolve' or 'brentq', "
+                             f"got {ball_radius_solver!r}")
+        self.ball_radius_solver = ball_radius_solver
 
         # Internal parameters
         self.save_path = None
@@ -329,6 +343,22 @@ class MiniBoxClassifier:
         frac1 = delta1 / (x1 * (1 + x1)**2)
         frac2 = delta2 / (x2 * (1 + x2)**2)
         return frac1 - frac2
+
+    def _ball_radius(self, delta1, rs1, delta2, rs2, r12) -> float:
+        """Distance from the substructure where the host's and the
+        substructure's NFW densities are equal (6D-ball radius, before the
+        cap at the substructure's R200b), using self.ball_radius_solver."""
+        args = (delta1, rs1, delta2, rs2, r12)
+        if self.ball_radius_solver == 'brentq':
+            # The density difference rises monotonically from -inf (at the
+            # substructure) to +inf (at the host), so the root in (0, r12) is
+            # unique and bracketed. Coincident seeds (r12 = 0) fall through.
+            lo, hi = 1e-9 * float(r12), (1.0 - 1e-9) * float(r12)
+            if (r12 > 0 and self._rho_nfw_roots(lo, *args) < 0
+                    and self._rho_nfw_roots(hi, *args) > 0):
+                return float(brentq(self._rho_nfw_roots, lo, hi, args=args))
+        # Original solver, started at half the distance between the seeds.
+        return float(fsolve(func=self._rho_nfw_roots, x0=0.5*r12, args=args)[0])
 
     def _load_particles(self):
         """Load the particles for this region (core plus padding) from the data source.
@@ -707,20 +737,11 @@ class MiniBoxClassifier:
             
             # Defines the search radius of the 6D ball. Distance from the 
             # substructure where the NFW density of both objects is equal.
-            r_ball = fsolve(
-                func=self._rho_nfw_roots,
-                # Start at half the distance bewteen seeds.
-                x0=0.5*r_ij,
-                args=(
-                    self.deltac[i], 
-                    self.rs[i], 
-                    deltac_near[j], 
-                    rs_near[j], 
-                    r_ij
-                ))
+            root = self._ball_radius(
+                self.deltac[i], self.rs[i], deltac_near[j], rs_near[j], r_ij)
             # Kept as a float64 numpy scalar so the comparison against float32
             # squared distances is done in float64, as before.
-            r_ball = numpy.float64(min(float(r_ball[0]), float(r200b_near[j])))
+            r_ball = numpy.float64(min(root, float(r200b_near[j])))
 
             # Particles (positions into within_r200b) inside the 6D ball.
             ball6d = self._particles_in_6d_ball(
@@ -1363,7 +1384,8 @@ def process_minibox(i, **kwargs):
         Keyword arguments forwarded to MiniBoxClassifier constructor.
         Required keys: min_num_part, boxsize, minisize, load_path, run_name,
         particle_type, seed_prop_names, redshift. Optional keys: padding,
-        fast_mass, disable_tqdm, data_source, seed_tie_break.
+        fast_mass, disable_tqdm, data_source, seed_tie_break,
+        ball_radius_solver.
 
     Returns
     -------
@@ -1417,6 +1439,7 @@ def process_all_miniboxes(
     n_threads: int = None,
     data_source: SpatialDataSource | None = None,
     seed_tie_break: str = 'halo_id',
+    ball_radius_solver: str = 'fsolve',
 ) -> list[dict]:
     """Process all mini-boxes in parallel to generate individual halo catalogs.
 
@@ -1463,6 +1486,9 @@ def process_all_miniboxes(
         How ties in M200b (seed order) and in Morb (percolation order) are
         broken; see MiniBoxClassifier. Use 'load_order' only to reproduce the
         reference code exactly.
+    ball_radius_solver : {'fsolve', 'brentq'}, default='fsolve'
+        Solver for the 6D-ball radius; see MiniBoxClassifier. 'brentq' always
+        finds the intended radius; 'fsolve' is the original solver.
  
 
     Returns
@@ -1546,6 +1572,7 @@ def process_all_miniboxes(
         disable_tqdm=True,
         data_source=data_source,
         seed_tie_break = seed_tie_break,
+        ball_radius_solver = ball_radius_solver,
     )
     
     # Run regions in parallel, or one by one if n_threads == 1.
@@ -1825,6 +1852,7 @@ def run_orbiting_mass_assignment(
     cleanup: bool | str = False,
     data_source: SpatialDataSource | None = None,
     seed_tie_break: str = 'halo_id',
+    ball_radius_solver: str = 'fsolve',
 ) -> None:
     """Generate complete halo catalog using kinetic energy classification.
 
@@ -1882,6 +1910,9 @@ def run_orbiting_mass_assignment(
         How ties in M200b (seed order) and in Morb (percolation order) are
         broken; see MiniBoxClassifier. Use 'load_order' only to reproduce the
         reference code exactly.
+    ball_radius_solver : {'fsolve', 'brentq'}, default='fsolve'
+        Solver for the 6D-ball radius; see MiniBoxClassifier. 'brentq' always
+        finds the intended radius; 'fsolve' is the original solver.
 
     Returns
     -------
@@ -1964,6 +1995,7 @@ def run_orbiting_mass_assignment(
             n_threads=n_threads,
             data_source = data_source,
             seed_tie_break = seed_tie_break,
+            ball_radius_solver = ball_radius_solver,
         )
     with timer('merge'):
         merge_catalogues(
@@ -2000,6 +2032,7 @@ def run_tiled_orbiting_mass_assignment(
     fast_mass: bool = False,
     n_threads: int = None,
     seed_tie_break: str = 'halo_id',
+    ball_radius_solver: str = 'fsolve',
 ) -> None:
     """Run OASIS on pre-built core+ribbon tiles and merge into one catalogue.
 
@@ -2048,6 +2081,9 @@ def run_tiled_orbiting_mass_assignment(
         broken; see MiniBoxClassifier. Keep 'halo_id' when comparing with an
         untiled run: with 'load_order' the result depends on how seeds are
         stored in the tiles.
+    ball_radius_solver : {'fsolve', 'brentq'}, default='fsolve'
+        Solver for the 6D-ball radius; see MiniBoxClassifier. 'brentq' always
+        finds the intended radius; 'fsolve' is the original solver.
 
     Returns
     -------
@@ -2065,7 +2101,8 @@ def run_tiled_orbiting_mass_assignment(
                       min_num_part=min_num_part, boxsize=boxsize, padding=padding,
                       particle_type=particle_type, redshift=redshift, 
                       seed_prop_names=seed_prop_names, fast_mass=fast_mass,
-                      n_threads=n_threads, seed_tie_break=seed_tie_break)
+                      n_threads=n_threads, seed_tie_break=seed_tie_break,
+                      ball_radius_solver=ball_radius_solver)
     merge_tiled_run(load_path=load_path, run_name=run_name)
 
 
@@ -2083,7 +2120,7 @@ def _sha256(path: str) -> str:
 
 def _tiled_run_settings(tile_path, load_path, min_num_part, boxsize, padding,
                         particle_type, redshift, seed_prop_names, fast_mass,
-                        seed_tie_break):
+                        seed_tie_break, ball_radius_solver):
     """Tile ID, and everything that must be identical for all tiles of one run."""
     with h5py.File(tile_path,'r') as f:
         meta = f['tile_metadata'].attrs
@@ -2096,6 +2133,7 @@ def _tiled_run_settings(tile_path, load_path, min_num_part, boxsize, padding,
                     padding=float(padding), particle_type=particle_type,
                     redshift=float(redshift), seed_prop_names=list(seed_prop_names),
                     fast_mass=bool(fast_mass), seed_tie_break=seed_tie_break,
+                    ball_radius_solver=ball_radius_solver,
                     calibration_sha256=_sha256(load_path + 'calibration_pars.hdf5'),
                     tiling=tiling)
     return tile_id, settings
@@ -2122,6 +2160,7 @@ def process_tile(
         fast_mass: bool = False,
         n_threads: int = None,
         seed_tie_break: str = 'halo_id',
+        ball_radius_solver: str = 'fsolve',
         redo: bool = False,
 ) -> dict:
     """Process every core cell of one tile; safe to rerun after a failure.
@@ -2151,7 +2190,7 @@ def process_tile(
     cell_dir = run_dir + 'mini_box_catalogues/'
     tile_id, settings = _tiled_run_settings(
         tile_path, load_path, min_num_part, boxsize, padding, particle_type,
-        redshift, seed_prop_names, fast_mass, seed_tie_break)
+        redshift, seed_prop_names, fast_mass, seed_tie_break, ball_radius_solver)
     marker = done_dir + f'tile_{tile_id}.json'
 
     if os.path.exists(marker) and not redo:
@@ -2185,7 +2224,8 @@ def process_tile(
             boxsize=boxsize, minisize=source.cell_size, padding=padding,
             particle_type=particle_type, redshift=redshift,
             seed_prop_names=seed_prop_names, fast_mass=fast_mass,
-            n_threads=n_threads, data_source=source, seed_tie_break=seed_tie_break)
+            n_threads=n_threads, data_source=source, seed_tie_break=seed_tie_break,
+            ball_radius_solver=ball_radius_solver)
 
     done = dict(tile_id=tile_id, tile_path=os.path.abspath(tile_path),
                 settings=settings, region_ids=region_ids,

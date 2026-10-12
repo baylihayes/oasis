@@ -146,3 +146,19 @@ def test_partial_merge_holds_exactly_the_finished_tiles_haloes(prepared):
         got = dict(zip(f['Halo_ID'][()].tolist(), f['Norb'][()].tolist()))
     assert len(got) == keep.sum() > 0
     assert got == dict(zip(ref_id[keep].tolist(), ref_norb[keep].tolist()))
+
+
+def test_ball_radius_solver_recorded_and_not_mixed(prepared):
+    """The solver is part of the run settings: it is written to the manifest,
+    and a tile cannot be reprocessed into the same run with the other solver."""
+    path, tiles = prepared
+    for t in tiles:
+        process_tile(t, load_path=path, run_name='brentq', ball_radius_solver='brentq',
+                     **COMMON)
+    manifest = merge_tiled_run(path, 'brentq')
+    assert manifest['settings']['ball_radius_solver'] == 'brentq'
+    assert manifest['verify'] == 'passed'
+    with open(path + 'run_ref/manifest.json') as f:
+        assert json.load(f)['settings']['ball_radius_solver'] == 'fsolve'
+    with pytest.raises(ValueError, match="different settings"):
+        process_tile(tiles[0], load_path=path, run_name='brentq', **COMMON)
