@@ -686,6 +686,14 @@ class MiniBoxClassifier:
         a = 1 / (1 + self.redshift)
         v_ball_sq_phys_near = 2**2 * G_GRAVITY * self.m200b[near_idx] / r200b_near / a
 
+        # KD-tree over the host's own particles (within 2*R200b), built once per
+        # host: each 6D-ball query then returns only host particles, instead of
+        # every loaded particle in the ball (millions near a massive cluster)
+        # that would be discarded right away.
+        host_tree = cKDTree(self.pos_part[within_r200b], boxsize=self.boxsize,
+                            balanced_tree=False, compact_nodes=False)
+
+
         # Loop over other seeds
         j = 0
         is_halo = True
@@ -717,7 +725,7 @@ class MiniBoxClassifier:
             # Particles (positions into within_r200b) inside the 6D ball.
             ball6d = self._particles_in_6d_ball(
                 within_r200b, pos_near[j], vel_near[j], r_ball,
-                v_ball_sq_phys_near[j],
+                v_ball_sq_phys_near[j], host_tree,
             )
 
             # Compare to the original orbiting population.
@@ -758,6 +766,7 @@ class MiniBoxClassifier:
         center_vel: numpy.ndarray,
         r_ball: numpy.float64,
         v_ball_sq: numpy.floating,
+        host_tree: cKDTree | None = None,
     ) -> numpy.ndarray:
         """Return positions in `within_r200b` of the particles inside a 6D ball.
 
@@ -793,6 +802,11 @@ class MiniBoxClassifier:
 
         if numpy.isinf(r_ball_sq):
             loc = numpy.arange(within_r200b.size)
+        elif host_tree is not None:
+            # Tree over the host's particles: indices are positions in within_r200b.
+            loc = numpy.sort(numpy.asarray(
+                host_tree.query_ball_point(center_pos, abs(r_ball)+self._search_margin),
+                dtype = numpy.intp))
         else:
             candidates = numpy.asarray(
                 self.position_tree.query_ball_point(
