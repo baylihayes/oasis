@@ -2569,7 +2569,7 @@ def self_calibration(
 
     # Mask outliers
     abs_dev = numpy.abs(gradient_minumum_positive - numpy.median(gradient_minumum_positive))
-    median_abs_dev = 1.4286 * numpy.median(abs_dev)
+    median_abs_dev = 1.4826 * numpy.median(abs_dev)
     mask_outliers = abs_dev <= 3. * median_abs_dev
     
     # Find slope by fitting to the minima.
@@ -2609,7 +2609,7 @@ def self_calibration(
 
     # Mask outliers
     abs_dev = numpy.abs(gradient_minumum_negative - numpy.median(gradient_minumum_negative))
-    median_abs_dev = 1.4286 * numpy.median(abs_dev)
+    median_abs_dev = 1.4826 * numpy.median(abs_dev)
     mask_outliers = abs_dev <= 3. * median_abs_dev
 
     # Find abscissa initial guess by fitting to the minima.
@@ -2720,7 +2720,7 @@ def calibrate(
     omega_m : float, optional
         Matter density parameter at redshift z, \Omega_m(z) for cosmology-based 
         calibration. If provided, uses empirical scaling relations. Must be 
-        positive. Standard Lambda-CDM values:
+        positive. Standard Lambda-CDM values at z = 0:
         - Planck 2018: \Omega_m ≈ 0.315
         - WMAP: \Omega_m ≈ 0.27
         If None (default), performs full self-calibration from simulation data.
@@ -2855,7 +2855,7 @@ def calibrate(
     ...     diagnostics=True
     ... )
     """
-    if omega_m:
+    if omega_m is not None:
         if omega_m <=0 or omega_m > 1:
             raise ValueError("Omega_m out of bounds.")
         

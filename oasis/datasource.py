@@ -70,6 +70,10 @@ class SpatialDataSource(ABC):
         """
         Region IDs in the order they should be submitted to workers.
 
+        Returns
+        -------
+        list[int]
+            A list of Region IDs, in the order they are submitted to workers.
         """
         return self.region_ids()
 
@@ -89,7 +93,7 @@ class SpatialDataSource(ABC):
 
 class LegacyMiniBoxDataSource(SpatialDataSource):
     """
-    Reads today's minibox HDF5 files (mini_boxes_nside_<n>/<id>.hdf5).
+    Reads the previous minibox HDF5 files (mini_boxes_nside_<n>/<id>.hdf5).
     
     """
     def __init__(self, load_path, boxsize, minisize, particle_type,

@@ -2010,12 +2010,12 @@ def run_orbiting_mass_assignment(
             os.remove(catalogues_path + item)
         os.removedirs(catalogues_path)
         print("Catalogues Cleaned Up")
-    if cleanup == 'all':
+    if cleanup == 'all' and data_source is None:
         n_cells = int(numpy.ceil(boxsize / minisize))
         mini_boxes_path = load_path + f'mini_boxes_nside_{n_cells}/'
         for item in os.listdir(mini_boxes_path):
             os.remove(mini_boxes_path + item)
-        os.removedirs(mini_boxes_path)
+        os.rmdir(mini_boxes_path)
 
     return None
 

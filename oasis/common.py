@@ -10,6 +10,7 @@ from time import perf_counter
 from typing import Callable, Optional, Tuple, Union
 import resource
 from contextlib import contextmanager
+import sys
 
 import numpy
 
@@ -620,9 +621,16 @@ def _validate_seed_data(
 
 
 def peak_rss_mb() -> float:
-    """Peak resident memory of this process so far, in MB (linux reports kB, macOS
-    reports in bytes)."""
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    """Peak resident memory of this process so far, in MB.
+     
+    Returns
+    -------
+    float
+       ``ru_maxrss`` converted to MB (Linux reports kB, macOS
+        reports in bytes).
+    """
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return rss / 1024.0**2 if sys.platform == 'darwin' else rss / 1024.0
 
 
 class StageTimer:
