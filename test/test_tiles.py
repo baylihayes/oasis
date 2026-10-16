@@ -378,3 +378,89 @@ def test_candidate_rows_never_drop_a_needed_row(kw):
         one = np.zeros(spec.n_tiles, dtype=bool)
         one[0] = True
         assert len(_candidate_rows(pos, spec, one)) < 0.05 * len(pos)
+
+
+# --- Parallel build (ChunkTasks + n_workers) and the interior-chunk shortcut ---
+
+def _load_npz_slice(task):
+    """Module-level loader (sent to worker processes): rows a:b of an .npz."""
+    path, a, b = task
+    with np.load(path) as d:
+        return {k: d[k][a:b] for k in d.files}
+
+
+def _spatial_inputs(tmp_path, n=60000, n_seeds=400, seed=7):
+    """Particles and seeds saved in spatially compact chunks, like snapshot
+    files: sorted by a coarse grid cell, so many chunks lie inside one core."""
+    rng = np.random.default_rng(seed)
+    out = {}
+    for kind, m in (('parts', n), ('seeds', n_seeds)):
+        pos = rng.uniform(0, L, (m, 3))
+        cell = (pos // (L / 8)).astype(int) @ np.array([1, 8, 64])
+        o = np.argsort(cell, kind='stable')
+        d = dict(ID=np.arange(m)[o], pos=pos[o], vel=rng.normal(size=(m, 3))[o].astype(np.float32))
+        if kind == 'seeds':
+            d.update(M200b=rng.uniform(1, 2, m)[o], R200b=rng.uniform(.1, .5, m)[o],
+                     Rs=rng.uniform(.01, .05, m)[o])
+        path = str(tmp_path / f'{kind}.npz')
+        np.savez(path, **d)
+        size = 1500 if kind == 'parts' else 40
+        out[kind] = [(path, a, a + size) for a in range(0, m, size)]
+    return out
+
+
+def _read_all(path):
+    out = {}
+    with h5py.File(path) as f:
+        f.visititems(lambda k, v: out.__setitem__(k, v[()]) if isinstance(v, h5py.Dataset) else None)
+        out['attrs'] = {k: np.asarray(v).tolist() for k, v in f['tile_metadata'].attrs.items()}
+    return out
+
+
+@pytest.mark.parametrize("tile_ids", [None, [0, 5]])
+def test_parallel_build_identical_to_serial(tmp_path, tile_ids):
+    """n_workers > 1 with a ChunkTasks factory gives byte-identical tile files
+    to the serial build."""
+    from oasis.tiles import ChunkTasks
+    spec = TileSpec(boxsize=L, tiles_per_side=2, buffer_width=5.0, inner_cell_size=L / 2 / 5)
+    tasks = _spatial_inputs(tmp_path)
+    parts = ChunkTasks(_load_npz_slice, tasks['parts'])
+    seeds = ChunkTasks(_load_npz_slice, tasks['seeds'])
+    build_tiles(parts, seeds, str(tmp_path / 'serial'), spec, particle_mass=1.0, tile_ids=tile_ids)
+    build_tiles(parts, seeds, str(tmp_path / 'parallel'), spec, particle_mass=1.0, tile_ids=tile_ids,
+                n_workers=3)
+    built = sorted(p.name for p in (tmp_path / 'serial').iterdir())
+    assert built == sorted(p.name for p in (tmp_path / 'parallel').iterdir())
+    assert all(name.startswith('tile_') for name in built)       # no buckets left
+    for name in built:
+        a, b = _read_all(tmp_path / 'serial' / name), _read_all(tmp_path / 'parallel' / name)
+        assert a.keys() == b.keys()
+        for k in a:
+            if k == 'attrs':
+                assert a[k] == b[k]
+            else:
+                assert a[k].dtype == b[k].dtype
+                np.testing.assert_array_equal(a[k], b[k], err_msg=f'{name}:{k}')
+
+
+def test_interior_shortcut_matches_assign_to_tiles():
+    """Chunks inside one core (away from its ribbons) take the shortcut, and the
+    shortcut returns exactly what assign_to_tiles returns; chunks near a face
+    or spanning two tiles do not take it."""
+    from oasis.tiles import _interior_tile
+    spec = TileSpec(boxsize=L, tiles_per_side=4, buffer_width=5.0, inner_cell_size=L / 4 / 5)
+    core, w = spec.core_size, spec.buffer_width
+    rng = np.random.default_rng(3)
+    for lo, hi, expect in (((w + 1e-3, w + 1e-3, w + 1e-3), (core - w - 1e-3,) * 3, True),
+                           ((core + w + 1, 2 * core + w + 1, w + 1), (2 * core - w - 1, 3 * core - w - 1, core - w - 1), True),
+                           ((w, w + 1, w + 1), (core - w - 1,) * 3, False),       # touches a ribbon (t <= w)
+                           ((w + 1,) * 3, (core - w,) + (core - w - 1,) * 2, False),  # t >= core - w
+                           ((w + 1,) * 3, (core + 1, core - w - 1, core - w - 1), False)):  # two tiles
+        pos = wrap_positions(rng.uniform(lo, hi, (5000, 3)), L)
+        pos[0], pos[1] = np.float32(lo), np.float32(hi)            # include the extremes
+        t = _interior_tile(pos, spec)
+        assert (t is not None) == expect
+        if t is not None:
+            rows, tiles, in_core = assign_to_tiles(pos, spec)
+            np.testing.assert_array_equal(rows, np.arange(len(pos)))
+            assert np.all(tiles == t) and in_core.all()

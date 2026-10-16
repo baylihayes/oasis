@@ -1,12 +1,14 @@
 """Build core+ribbon tiles for very large simulations (MDPL2)
 
 The box is split into tiles_per_side**3 cubic cores. Each tile stores the rows
-of its core plus a ribbon of width 'buffer_width' around it, always in GLOBAL
+of its core plus a ribbon of width 'buffer_width' around it, always in global
 coordinates (nothing is shifted or wrapped per tile). Inside a tile, rows are
 grouped by inner cell, with an offset table so a cell is one contiguous slice.
 
 """
 import os
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from itertools import product
 from typing import Callable, Iterator
@@ -29,19 +31,26 @@ class TileSpec:
     Raises
     ------
     ValueError
-        If buffer_width < 0, if the ribbon is so wide that a tile would overlap
-        itself across the periodic boundary, or if inner_cell_size does not
-        divide the core size.
+        If tiles_per_side is < 1, if inner_cell_size <=0, if buffer_width < 0 
+        or greater than the core size, if the ribbon is so wide that a tile would 
+        overlap itself across the periodic boundary, or if inner_cell_size does 
+        not divide the core size.
     """
 
-    boxsize: float          #global periodic box size, e.g. 1000.0
+    boxsize: float          #global periodic box size, e.g. 1000.0 Mpc / h
     tiles_per_side: int     # e.g. 5 -> 125 tiles
     buffer_width: float     # ribbon width w
-    inner_cell_size: float # e.g. 25.0
+    inner_cell_size: float # e.g. 25.0 Mpc / h
 
     def __post_init__(self):
+        if self.tiles_per_side < 1 or self.inner_cell_size <= 0:
+            raise ValueError("tiles_per_side must be >= 1 and "
+            "inner_cell_size > 0.")
         if self.buffer_width < 0:
             raise ValueError("buffer_width must be >= 0.")
+        if self.buffer_width > self.core_size:
+            raise ValueError("buffer_width must not exceed the core size "
+                             "(boxsize / tiles_per_side).")
         if self.core_size + 2 * self.buffer_width > self.boxsize:
             raise ValueError("ribbon too wide: a tile would overlap itself "
                              "across the periodic boundary.")
@@ -174,6 +183,22 @@ def local_cell_ids(pos: np.ndarray, tile_id: int, spec: TileSpec) -> np.ndarray:
 # Stage 1
 ChunkFactory = Callable[[], Iterator[dict]]     # returns a new iterator each call
 
+
+class ChunkTasks:
+    """
+    A chunk factory whose chunks can be read in parallel: chunk k is
+    ``load(tasks[k])``. Calling it returns the chunks in order, so it can be
+    used anywhere a plain chunk factory is accepted; build_tiles(n_workers > 1)
+    reads and assigns several chunks at once. ``load`` must be a module-level
+    function (it is sent to worker processes), e.g. one snapshot file per task.
+    """
+    def __init__(self, load: Callable[[object], dict], tasks):
+        self.load = load
+        self.tasks = list(tasks)
+
+    def __call__(self) -> Iterator[dict]:
+        return (self.load(t) for t in self.tasks)
+
 def _candidate_rows(pos: np.ndarray, spec: TileSpec, wanted: np.ndarray):
     """
     Rows that may lie in the core or ribbon of a wanted tile, or None if every
@@ -202,8 +227,126 @@ def _candidate_rows(pos: np.ndarray, spec: TileSpec, wanted: np.ndarray):
         keep = allowed[b] if keep is None else keep & allowed[b]
     return None if keep is None else np.flatnonzero(keep)
 
+def _interior_tile(pos: np.ndarray, spec: TileSpec):
+    """
+    Tile whose core holds every row of `pos` in a chunk with no row in any ribbon, or None.
+
+    Then assign_to_tiles would return exactly (arange(n), that tile, all True):
+    t = x - i0 * core is monotonic in x for a fixed i0, so the rows' extreme
+    values decide the ribbon tests (t <= w, t >= core - w) for all rows.
+    """
+    if pos.shape[0] == 0:
+        return None
+    n, core, w = spec.tiles_per_side, spec.core_size, spec.buffer_width
+    lo = np.asarray(pos.min(axis=0), dtype=np.float64)
+    hi = np.asarray(pos.max(axis=0), dtype=np.float64)
+    i_lo = np.minimum((lo // core).astype(np.int64), n - 1)
+    i_hi = np.minimum((hi // core).astype(np.int64), n - 1)
+    if np.any(i_lo != i_hi):
+        return None
+    if np.any(lo - i_lo * core <= w) or np.any(hi - i_lo * core >= core - w):
+        return None
+    return int(i_lo[0] + i_lo[1] * n + i_lo[2] * n**2)
+
+
+def _rows_for_tiles(pos: np.ndarray, spec: TileSpec, wanted: np.ndarray):
+    """(rows, tiles, in_core) of one chunk's wrapped positions, as from
+    assign_to_tiles on the pre-filtered rows (rows index the chunk)."""
+    t = _interior_tile(pos, spec)
+    if t is not None and wanted[t]:
+        # Every row is in the core of one wanted tile: the pre-filter keeps all
+        # rows and assign_to_tiles returns exactly this.
+        n = pos.shape[0]
+        return (np.arange(n, dtype=np.int64), np.full(n, t, dtype=np.int64),
+                np.ones(n, dtype=bool))
+    cand = _candidate_rows(pos, spec, wanted)
+    if cand is None:
+        return assign_to_tiles(pos, spec)
+    rows, tiles, in_core = assign_to_tiles(pos[cand], spec)
+    return cand[rows], tiles, in_core
+
+
+def _chunk_fields(chunk: dict) -> dict:
+    """Column name -> (dtype, trailing shape) as stored in the buckets."""
+    fields = {k: (np.asarray(v).dtype, np.shape(v)[1:]) for k, v in chunk.items()}
+    fields['pos'] = (np.dtype(np.float32), (3,))
+    if 'vel' in fields:
+        # Velocities are stored as float32, like the minibox files.
+        fields['vel'] = (np.dtype(np.float32), (3,))
+    return fields
+
+
+def _count_chunk(chunk: dict, spec: TileSpec, wanted: np.ndarray):
+    """Pass 1 for one chunk: rows per tile, and the chunk's columns."""
+    pos = wrap_positions(chunk['pos'], spec.boxsize)
+    _, tiles, _ = _rows_for_tiles(pos, spec, wanted)
+    return np.bincount(tiles, minlength=spec.n_tiles), _chunk_fields(chunk)
+
+
+def _pieces_chunk(chunk: dict, spec: TileSpec, wanted: np.ndarray, names):
+    """Pass 2 for one chunk: [(tile, {column: rows}, in_core)] for the wanted
+    tiles, in increasing tile order and in chunk order within the tile."""
+    chunk = dict(chunk, pos=wrap_positions(chunk['pos'], spec.boxsize))
+    if 'vel' in chunk:
+        chunk['vel'] = np.asarray(chunk['vel'], dtype=np.float32)
+    rows, tiles, in_core = _rows_for_tiles(chunk['pos'], spec, wanted)
+    keep = wanted[tiles]
+    rows, tiles, in_core = rows[keep], tiles[keep], in_core[keep]
+    order = np.argsort(tiles, kind='stable')
+    rows, tiles, in_core = rows[order], tiles[order], in_core[order]
+    bounds = np.searchsorted(tiles, np.arange(spec.n_tiles + 1))
+    pieces = []
+    for t in np.flatnonzero(np.diff(bounds)):
+        sel = slice(bounds[t], bounds[t + 1])
+        r = rows[sel]
+        pieces.append((int(t), {k: np.asarray(chunk[k])[r] for k in names}, in_core[sel]))
+    return pieces
+
+
+def _count_task(args):
+    """
+    Wrapper for _count_chunk() to run inside a worker process.
+
+    See also
+    --------
+    _count_chunk(chunk: dict, spec: TileSpec, wanted: np.ndarray)
+    """
+    load, task, spec, wanted = args
+    return _count_chunk(load(task), spec, wanted)
+
+
+def _pieces_task(args):
+    """
+    Wrapper for _pieces_chunk() to run inside a worker process.
+
+    See also
+    --------
+    _pieces_chunk(chunk: dict, spec: TileSpec, wanted: np.ndarray, names)
+    """
+    load, task, spec, wanted, names = args
+    return _pieces_chunk(load(task), spec, wanted, names)
+
+
+def _in_order(fn, jobs, n_workers):
+    """fn(job) for each job, yielded in job order. With n_workers > 1 the jobs
+    run in worker processes, at most 2 * n_workers ahead of the consumer (so
+    finished results waiting to be written stay bounded in memory)."""
+    if n_workers <= 1:
+        for job in jobs:
+            yield fn(job)
+        return
+    with ProcessPoolExecutor(n_workers) as pool:
+        pending = deque()
+        for job in jobs:
+            pending.append(pool.submit(fn, job))
+            if len(pending) >= 2 * n_workers:
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
+
+
 def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
-                      kind: str, tile_ids = None) -> np.ndarray:
+                      kind: str, tile_ids = None, n_workers: int = 1) -> np.ndarray:
     """
     Stream input chunks into one unsorted bucket file per tile.
     
@@ -213,6 +356,11 @@ def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
     Only the tiles in tile_ids (default: all) get a bucket file, and rows that
     cannot reach them are skipped early; the counts returned are complete only
     for those tiles.
+
+    With n_workers > 1 and a ChunkTasks factory, chunks are read and assigned
+    to tiles in parallel worker processes; they are still written in chunk
+    order, so the bucket files are identical to a serial run. Other factories
+    are always processed serially.
     
     Raises
     ------
@@ -226,24 +374,24 @@ def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
                 else np.unique(np.asarray(tile_ids, dtype = np.int64)))
     wanted = np.zeros(spec.n_tiles, dtype = bool)
     wanted[tile_ids] = True
+    parallel = n_workers > 1 and isinstance(make_chunks, ChunkTasks)
 
+    # Pass 1: count rows per tile
+    if parallel:
+        results = _in_order(_count_task, [(make_chunks.load, task, spec, wanted)
+                                          for task in make_chunks.tasks], n_workers)
+    else:
+        results = (_count_chunk(chunk, spec, wanted) for chunk in make_chunks())
     counts = np.zeros(spec.n_tiles, dtype = np.int64)
     fields = None
-    for chunk in make_chunks():         # pass 1: count
-        pos = wrap_positions(chunk['pos'], spec.boxsize)
-        cand = _candidate_rows(pos, spec, wanted)
-        _, tiles, _ = assign_to_tiles(pos if cand is None else pos[cand], spec)
-        counts += np.bincount(tiles, minlength=spec.n_tiles)
+    for chunk_counts, chunk_fields in results:
+        counts += chunk_counts
         if fields is None:
-            fields = {k: (np.asarray(v).dtype, np.shape(v)[1:])
-                      for k, v in chunk.items()}
-            fields['pos'] = (np.dtype(np.float32), (3,))
-            if 'vel' in fields:
-                #   Velocities are stored as float32, like the minibox files.
-                fields['vel'] = (np.dtype(np.float32), (3,))
+            fields = chunk_fields
     if fields is None:
         raise ValueError(f"No input chunks for '{kind}': make_chunks() yielded nothing. "
                          "Check input path.")
+    names = list(fields)
 
     os.makedirs(out_dir, exist_ok = True)
     files = {t: h5py.File(os.path.join(out_dir, f'bucket_{kind}_{t}.hdf5'), 'w')
@@ -257,29 +405,20 @@ def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
             d['in_core'] = f.create_dataset('in_core', shape=(counts[t],), dtype = bool)
             dsets[t] = d
 
+        # Pass 2: write each chunk's rows at the end of its tiles' buckets
+        if parallel:
+            results = _in_order(_pieces_task, [(make_chunks.load, task, spec, wanted, names)
+                                               for task in make_chunks.tasks], n_workers)
+        else:
+            results = (_pieces_chunk(chunk, spec, wanted, names) for chunk in make_chunks())
         cursor = np.zeros(spec.n_tiles, dtype = np.int64)
-        for chunk in make_chunks():                 # pass 2: write
-            chunk = dict(chunk, pos = wrap_positions(chunk['pos'], spec.boxsize))
-            if 'vel' in chunk:
-                chunk['vel'] = np.asarray(chunk['vel'], dtype = np.float32)
-            cand = _candidate_rows(chunk['pos'], spec, wanted)
-            if cand is None:
-                rows, tiles, in_core = assign_to_tiles(chunk['pos'], spec)
-            else: 
-                rows, tiles, in_core = assign_to_tiles(chunk['pos'][cand], spec)
-                rows = cand[rows]
-            keep = wanted[tiles]
-            rows, tiles, in_core = rows[keep], tiles[keep], in_core[keep]
-            order = np.argsort(tiles, kind = 'stable')
-            rows, tiles, in_core = rows[order], tiles[order], in_core[order]
-            bounds = np.searchsorted(tiles, np.arange(spec.n_tiles + 1))
-            for t in np.flatnonzero(np.diff(bounds)):
-                sel = slice(bounds[t], bounds[t + 1])
-                r, c0 = rows[sel], cursor[t]
-                for k in fields:
-                    dsets[t][k][c0:c0 + r.size] = np.asarray(chunk[k])[r]
-                dsets[t]['in_core'][c0:c0 + r.size] = in_core[sel]
-                cursor[t] += r.size
+        for pieces in results:
+            for t, columns, in_core in pieces:
+                c0, n = cursor[t], in_core.size
+                for k in names:
+                    dsets[t][k][c0:c0 + n] = columns[k]
+                dsets[t]['in_core'][c0:c0 + n] = in_core
+                cursor[t] += n
         if not np.array_equal(cursor[tile_ids], counts[tile_ids]):
             raise RuntimeError("input changed between the two passes.")
     finally:
@@ -348,7 +487,7 @@ def build_tile(bucket_path: str, tile_path: str, tile_id: int, spec: TileSpec,
 def build_tiles(make_particle_chunks: ChunkFactory, make_seed_chunks: ChunkFactory, 
                 out_dir: str, spec: TileSpec, particle_mass: float | None = None,
                 keep_buckets: bool = False, overwrite: bool = False,
-                tile_ids = None) -> None:
+                tile_ids = None, n_workers: int = 1) -> None:
     """
     Builds the tiles in tile_ids (default: all), so a large box can be built in groups
     of tiles: each call reads the whole input twice, but bucket files (as large as the 
@@ -379,6 +518,10 @@ def build_tiles(make_particle_chunks: ChunkFactory, make_seed_chunks: ChunkFacto
         Delete this call's existing tile/bucket files in out_dir first.
     tile_ids : iterable of int, optional
         Tiles to build (0 <= id < spec.n_tiles). Default: all tiles. 
+    n_workers : int, default=1
+        Worker processes. Chunks of ChunkTasks factories are read and assigned
+        to tiles in parallel (written in order), and tiles are sorted into
+        cells in parallel. The tile files are identical for any n_workers.
 
     Raises
     ------
@@ -410,13 +553,23 @@ def build_tiles(make_particle_chunks: ChunkFactory, make_seed_chunks: ChunkFacto
             os.remove(path)
 
 
-    bucket_into_tiles(make_particle_chunks, out_dir, spec, 'particles', tile_ids)
-    bucket_into_tiles(make_seed_chunks, out_dir, spec, 'seeds', tile_ids)
+    bucket_into_tiles(make_particle_chunks, out_dir, spec, 'particles', tile_ids,
+                      n_workers=n_workers)
+    bucket_into_tiles(make_seed_chunks, out_dir, spec, 'seeds', tile_ids,
+                      n_workers=n_workers)
     attrs = {} if particle_mass is None else {'particle_mass': particle_mass}
-    for t in tile_ids:
-        tile_path = os.path.join(out_dir, f'tile_{t}.hdf5')
-        for kind in ('particles', 'seeds'):
-            bucket = os.path.join(out_dir, f'bucket_{kind}_{t}.hdf5')
-            build_tile(bucket, tile_path, t, spec, kind, attrs= attrs)
-            if not keep_buckets:
-                os.remove(bucket)
+    # Each tile is sorted into its own file, so tiles can be sorted in parallel.
+    jobs = [(out_dir, t, spec, attrs, keep_buckets) for t in tile_ids]
+    for _ in _in_order(_sort_tile_task, jobs, min(n_workers, len(jobs))):
+        pass
+
+
+def _sort_tile_task(args):
+    """Stage 2 for one tile: both buckets into the tile file, then delete them."""
+    out_dir, t, spec, attrs, keep_buckets = args
+    tile_path = os.path.join(out_dir, f'tile_{t}.hdf5')
+    for kind in ('particles', 'seeds'):
+        bucket = os.path.join(out_dir, f'bucket_{kind}_{t}.hdf5')
+        build_tile(bucket, tile_path, t, spec, kind, attrs=attrs)
+        if not keep_buckets:
+            os.remove(bucket)
