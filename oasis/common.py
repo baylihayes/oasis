@@ -1,3 +1,7 @@
+"""Shared utilities for OASIS: the gravitational constant, timing and memory
+tools (``timer``, ``TimerContext``, ``StageTimer``, ``peak_rss_mb``), directory
+creation, and the input validators used by the other modules."""
+
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial, wraps
@@ -13,12 +17,14 @@ __all__ = [
     'G_GRAVITY',
     'timer',
     'TimerContext',
-    'get_min_unit_dtype',
+    'get_min_uint_dtype',
     'ensure_dir_exists',
+    'StageTimer',
+    'peak_rss_mb'
 ]
 
 # Gravitational constant
-G_GRAVITY: float = 4.3e-09     # Mpc (km/s)^2 / M_sun
+G_GRAVITY: float = 4.3e-09     # Mpc (km/s)^2 / M_sun, same in h-scaled units.
 
 
 @dataclass(frozen=True)
@@ -94,8 +100,7 @@ def timer(
             remaining_seconds = elapsed % 3600
             minutes = int(remaining_seconds // 60)
             seconds = remaining_seconds % 60
-            miliseconds = int(10**precision * (seconds - int(seconds)))
-            elapsed_str = f"{hours:02d}:{minutes:02d}:{int(seconds):02d}.{miliseconds:03d}"
+            elapsed_str = f"{hours:02d}:{minutes:02d}:{seconds:0{3 + precision}.{precision}f}"
 
             if fancy:
                 print(
@@ -163,8 +168,7 @@ class TimerContext:
         remaining_seconds = self.elapsed % 3600
         minutes = int(remaining_seconds // 60)
         seconds = remaining_seconds % 60
-        miliseconds = int(10**self.precision * (seconds - int(seconds)))
-        elapsed_str = f"{hours:02d}:{minutes:02d}:{int(seconds):02d}.{miliseconds:03d}"
+        elapsed_str = f"{hours:02d}:{minutes:02d}:{seconds:0{3 + self.precision}.{self.precision}f}"
 
         if self.fancy:
             print(f"\t {AnsiColor.OKGREEN}completed in {AnsiColor.WARNING}{elapsed_str}{AnsiColor.ENDC}")
@@ -206,7 +210,7 @@ def get_min_uint_dtype(num: int) -> numpy.dtype:
     # Check in order of size
     for dtype in [numpy.uint8, numpy.uint16, numpy.uint32, numpy.uint64]:
         if num <= numpy.iinfo(dtype).max:
-            return dtype
+            return numpy.dtype(dtype)
 
     raise OverflowError(f"Number {num} exceeds maximum uint64 value")
 
@@ -309,7 +313,7 @@ def _validate_positive_number_non_zero(value: float | int, name: str) -> None:
         If `value` is negative or zero.
     """
     _validate_positive_number(value, name)
-    if value == 0 or value == 0.:
+    if value == 0:
         raise ValueError(f"{name} must be non-zero")
 
 
@@ -372,8 +376,32 @@ def _validate_existing_path(path: str | Path) -> None:
 
 
 def _validate_boxsize_minisize(boxsize: float | int, minisize: float | int) -> None:
-    """Validate that `boxsize` and `minisize` are positive, non-zero numbers
-    and that `minisize` does not exceed `boxsize`."""
+    """
+    Validate that `boxsize` and `minisize` are positive, non-zero numbers
+    and that `minisize` does not exceed `boxsize`.
+    
+    Parameters
+    ----------
+    boxsize : float | int
+        One side length of the full simulation. Usually in units of Mpc / h.
+    minisize : float | int
+        One side length of the sub boxes used to divide the full simulation.
+        Usually in units of Mpc / h
+    
+    Raises
+    ------
+    TypeError
+        If boxsize is not numeric
+    ValueError
+        If boxsize is negative or zero.
+    TypeError
+        If minibox size is not numeric
+    ValueError
+        If minibox size is negative or zero.
+    ValueError
+        If minibox size is larger than the boxsize. 
+    
+    """
     # Validate both are positive numbers
     _validate_positive_number_non_zero(boxsize, "boxsize")
     _validate_positive_number_non_zero(minisize, "minisize")
@@ -384,8 +412,34 @@ def _validate_boxsize_minisize(boxsize: float | int, minisize: float | int) -> N
 
 
 def _validate_mini_box_id(mini_box_id: int | numpy.integer, cells_per_side: int | numpy.integer) -> None:
-    """Validate that a mini-box ID is an integer within the valid range for a 
-    cubic grid defined by the number of cells per side."""
+    """
+    Validate that a mini-box ID is an integer within the valid range for a 
+    cubic grid defined by the number of cells per side.
+    
+    Parameters
+    ----------
+    mini_box_id : int | numpy.integer
+        The ID of the minibox.
+    cells_per_side : int | numpy.integer
+        Number of cells that fit along one length of the simulation box.
+    
+    Raises
+    ------
+    TypeError
+        If minibox ID is not an integer.
+    TypeError
+        If the minibox ID is not numeric.
+    ValueError
+        If the minibox ID is negative.
+    TypeError
+        If the number of cells per side is not an integer.
+    ValueError
+        If the number of cells per side is negative or zero.
+    ValueError
+        If the mini box ID exceeds the maximum number of cells within a cubic
+        grid with a total mini box number of cells_per_side**3. 
+    
+    """
     # Check mini_box_id is an integer
     if not isinstance(mini_box_id, (int, numpy.integer)):
         raise TypeError("mini_box_id must be an integer")
@@ -397,7 +451,7 @@ def _validate_mini_box_id(mini_box_id: int | numpy.integer, cells_per_side: int 
     if not isinstance(cells_per_side, (int, numpy.integer)):
         raise TypeError("cells_per_side must be a positive integer")
 
-    if cells_per_side is None or cells_per_side <= 0:
+    if cells_per_side <= 0:
         raise ValueError("cells_per_side must be a positive integer")
 
     # Validate mini_box_id is within valid range
@@ -413,7 +467,29 @@ def _validate_process_objects(
     data: Tuple[list | tuple, list | tuple, list | tuple], 
     n_items: int
 ) -> None:
-    """Validate the structure and contents of process object data."""
+    """
+    Validate the structure and contents of process object data.
+    
+    Parameters
+    ----------
+    data : Tuple[list | tuple, list | tuple, list | tuple]
+        The tuple containing the process object data.
+    n_items : int
+        Number of elements (rows) of list | tuple
+    
+    Raises
+    ------
+    ValueError
+        If data is not a tuple of (arrays, labels, dtypes).
+    ValueError
+        If the data contains other items besides tuples or lists.
+    ValueError
+        If an item in the data is not a NumPy array.
+    ValueError
+        If an array in the data has the incorrect number of rows (n_items).
+    ValueError
+        If the arrays, labels, and dtypes do not all have the same length. 
+    """
     # Check number of items in data must be three
     if not isinstance(data, tuple) or len(data) != 3:
         raise ValueError("data must be a tuple of (arrays, labels, dtypes)")
@@ -445,9 +521,56 @@ def _validate_inputs_load(
     load_path: str,
     padding: float,
 ) -> None:
-    """Validate inputs for load functions."""
-    _validate_mini_box_id(mini_box_id, int(numpy.ceil(boxsize / minisize)))
+    """
+    Validate inputs for load functions.
+    
+    Parameters
+    ----------
+    mini_box_id : int
+        The ID of the minibox.
+    boxsize : float
+        The side length of the simulation box.
+    minisize : float
+        The side length of a minibox inside the simulation box.
+    load_path : str
+        The path where the simulation data is stored and will be loaded from.
+    padding : float
+        The length of the padding on the edges of the miniboxes. 
+
+    Raises
+    ------
+    TypeError
+        If minibox ID is not an integer.
+    TypeError
+        If the minibox ID is not numeric.
+    ValueError
+        If the minibox ID is negative.
+    ValueError
+        If the mini box ID exceeds the maximum number of cells within a cubic 
+        grid with a total mini box number of cells_per_side**3.
+    TypeError
+        If boxsize is not numeric
+    ValueError
+        If boxsize is negative or zero.
+    TypeError
+        If minibox size is not numeric
+    ValueError
+        If minibox size is negative or zero.
+    ValueError
+        If minibox size is larger than the boxsize.
+    TypeError
+        If load_path is not a string or Path instance.
+    FileNotFoundError
+        If the load_path does not exist.
+    NotADirectoryError
+        If the load_path exists but is not a directory.
+    TypeError
+        If the padding is not numeric.
+    ValueError
+        If the padding is negative or zero.
+    """
     _validate_boxsize_minisize(boxsize, minisize)
+    _validate_mini_box_id(mini_box_id, int(numpy.ceil(boxsize / minisize)))
     _validate_existing_path(load_path)
     _validate_positive_number_non_zero(padding, "padding")
 
@@ -455,7 +578,29 @@ def _validate_inputs_load(
 def _validate_seed_data(
     seed_data: Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, numpy.ndarray]
 ) -> None:
-    """Validate the structure and consistency of seed data inputs."""
+    """
+    Validate the structure and consistency of seed data inputs.
+    
+    Parameters
+    ----------
+    seed_data : Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, numpy.ndarray]
+        The position, velocity, M200b, and R200b from the seed halo catalog.
+
+    Raises
+    ------
+    ValueError
+        If the seed_data input is not a tuple of 4 elements.
+    TypeError
+        If seed position is not a NumPy array.
+    ValueError
+        If seed position array is empty or has an invalid shape.
+    TypeError
+        If seed velocity is not a NumPy array.
+    ValueError
+        If seed velocity array is empty or has an invalid shape.
+    ValueError
+        If the elements are not all the same length.
+    """
     if len(seed_data) != 4:
         raise ValueError("seed_data must be a tuple of 4 elements")
 
@@ -473,8 +618,10 @@ def _validate_seed_data(
     if not (mass.size == radius.size == len(position) == len(velocity)):
         raise ValueError("All elements in seed_data must have the same length")
 
+
 def peak_rss_mb() -> float:
-    """Peak resident memory of this process so far, in MB (linux reports kB)."""
+    """Peak resident memory of this process so far, in MB (linux reports kB, macOS
+    reports in bytes)."""
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
 
