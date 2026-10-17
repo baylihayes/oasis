@@ -1,3 +1,14 @@
+"""Split a simulation into cubic mini-boxes and load them back.
+
+The box is split into ceil(boxsize / minisize)**3 mini-boxes. Each mini-box is
+one HDF5 file, save_path/mini_boxes_nside_<n>/<id>.hdf5, with one group per 
+particle type (e.g. 'dm' for particles, 'seed' for halo seeds from ROCKSTAR 
+halo catalogs) holding 'ID', 'pos', 'vel', the mass and any extra properties.
+
+Mini-box IDs are id = ix + iy*n + iz*n**2, where (ix, iy, iz) are the cell
+indicies along the x, y, z axes and n is the number of cells per side. 
+"""
+
 import os
 from multiprocessing.dummy import Pool as ThreadPool
 from pathlib import Path
@@ -40,9 +51,9 @@ def get_mini_box_id(
         Position(s) in cartesian coordinates. Can be:
         - 1D array of shape (3,) for a single position
         - 2D array of shape (N, 3) for N positions
-        Each position should have [x, y, z] coordinates within [0, boxsize).
+        Each position should have [x, y, z] coordinates within [0, boxsize].
     boxsize : float
-        Size of the cubic simulation box. Must be a positive.
+        Size of the cubic simulation box. Must be positive.
     minisize : float  
         Size of each cubic mini-box. Must be positive and ≤ boxsize.
 
@@ -58,27 +69,30 @@ def get_mini_box_id(
     TypeError
         If position is not a numpy array or boxsize or minisize are not numeric.
     ValueError
-        If minisize > boxsize, or if any coordinate is outside [0, boxsize),
+        If minisize > boxsize, or if any coordinate is outside [0, boxsize],
         or if position array has wrong dimensions, or if boxsize or minisize ≤ 0.
+    RuntimeError
+        If a computed grid index is out of range (should not happen for a valid input).
 
     Notes
     -----
     - Positions exactly at the upper boundary (boxsize) are adjusted inward
       by a small tolerance to ensure they fall within valid mini-boxes.
     - The function modifies the input array in-place for memory efficiency.
-    - The function uses a 3D-to-1D mapping: ID = i + j*nx + k*nx*ny
-      where (i,j,k) are grid indices and nx, ny, nz are grid dimensions.
+    - The function uses a 3D-to-1D mapping: ID = ix + iy*n + iz*n**2, where 
+        (ix, iy, iz) are the cell indicies along the x, y, z axes and n is 
+        the number of cells per side (n = ceil(boxsize / minisize)).
 
     Examples
     --------
     >>> import numpy as numpy
     >>> pos = numpy.array([1.5, 2.5, 3.5])
     >>> get_mini_box_id(pos, boxsize=10.0, minisize=2.0)
-    32
+    30
 
     >>> positions = numpy.array([[1.5, 2.5, 3.5], [0.1, 0.1, 0.1]])
     >>> get_mini_box_id(positions, boxsize=10.0, minisize=2.0)
-    array([32,  0])
+    array([30,  0])
     """
     EDGE_TOL = 1e-8
 
@@ -148,10 +162,11 @@ def get_adjacent_mini_box_ids(
     Returns
     -------
     numpy.ndarray
-        Array of shape (27,) containing all adjacent mini-box IDs, including
-        the input ID. The first element is always the input mini_box_id, 
-        followed by the 26 neighboring IDs in no particular order.
-        Array dtype is numpy.int32.
+        Array of shape (27,), dtype int32, containing all adjacent mini-box IDs, 
+        including the input ID. The first element is always the input mini_box_id, 
+        followed by the 26 neighboring IDs in a fixed order (dz, dy, dx each looping
+        over -1, 0, 1). With fewer than 3 cells per side the same ID appears more than 
+        once. 
 
     Raises
     ------
@@ -169,23 +184,22 @@ def get_adjacent_mini_box_ids(
     -----
     - Uses periodic boundary conditions: mini-boxes at grid boundaries are
       considered adjacent to mini-boxes on the opposite boundary.
-    - The 3D grid uses the mapping: ID = k + jxnx + ixnx², where (i,j,k) are
-      grid coordinates and nx is the number of cells per side.
+    - The 3D grid uses the mapping: ID = ix + iy*n + iz*n**2 (see mini_box_id).
     - For a grid with n cells per side, total mini-boxes = n³.
-    - The function always returns exactly 27 IDs regardless of grid size.
 
     Examples
     --------
     >>> import numpy as np
     >>> # 2x2x2 grid (8 total mini-boxes)
-    >>> get_adjacent_mini_box_ids(0, boxsize=2.0, minisize=1.0)
-    array([0, 1, 2, 3, 4, 5, 6, 7, ...], dtype=int32)  # All boxes due to wrapping
+    >>> ids = get_adjacent_mini_box_ids(0, boxsize=2.0, minisize=1.0)
+    >>> sorted(set(ids.tolist()))           # every box is a neighbor
+    [0, 1, 2, 3, 4, 5, 6, 7]
 
     >>> # Larger grid - interior box
     >>> ids = get_adjacent_mini_box_ids(111, boxsize=10.0, minisize=1.0)  # 10x10x10 grid
     >>> len(ids)
     27
-    >>> ids[0]  # First element is always the input ID
+    >>> int(ids[0])  # First element is always the input ID
     111
     """
     # Input validation
@@ -925,7 +939,8 @@ def load_seeds(
     # Final validation
     n_loaded = len(positions)
     if n_loaded == 0:
-        return (() for _ in range(7))
+        return (positions, velocities, ids, r200, m200, rs, mini_box_mask)
+
 
     # Sort seeds by M200 (largest first)
     argorder = numpy.argsort(-m200)
