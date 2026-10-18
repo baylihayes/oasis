@@ -11,7 +11,8 @@ of OASIS be run side by side without installing either.
 Steps: split the box into mini-boxes, compute self-calibration data (compared
 between runs), write cosmology-based calibration parameters, and build the halo
 catalogue. With --tiles N, the catalogue is built with the tiled pipeline
-(N tiles per side, ribbon = padding, inner cells = minisize) instead; this needs
+(N tiles per side, ribbon = padding, or no ribbon for N = 1, inner cells =
+minisize) instead; this needs
 a version of OASIS that has oasis.tiles.
 """
 import argparse
@@ -88,7 +89,8 @@ if args.tiles > 0:
     from oasis.tiles import TileSpec, build_tiles
 
     spec = TileSpec(boxsize=BOX, tiles_per_side=args.tiles,
-                    buffer_width=args.padding, inner_cell_size=args.minisize)
+                    buffer_width=0.0 if args.tiles == 1 else args.padding,
+                    inner_cell_size=args.minisize)
     f32 = np.float32
     parts = dict(ID=d['pid'], pos=d['pos'], vel=d['vel'])
     seeds = dict(ID=d['hid'], pos=d['s_pos'], vel=d['s_vel'],

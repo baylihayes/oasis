@@ -24,8 +24,9 @@ It makes three comparisons:
 1. **reference vs current**, with the current code run with
    `seed_tie_break='load_order'` (the reference's order for seeds with equal
    M200b). Must pass in `--mode reference`.
-2. **(with `--tiled`) current mini-box run vs current tiled run**, both with
-   the default `seed_tie_break='halo_id'`. Must pass in `--mode tiled`.
+2. **(with `--tiled`) current mini-box run vs current tiled runs** (2 tiles
+   per side, and a single tile for the whole box), all with the default
+   `seed_tie_break='halo_id'`. Must pass in `--mode tiled`.
 3. **Informational:** how many haloes the default tie-break changes compared
    with the reference order. Never fails; it records the effect of that
    deliberate change.

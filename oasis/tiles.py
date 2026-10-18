@@ -28,13 +28,21 @@ class TileSpec:
     inner cells of size inner_cell_size; `ring` extra cells per side hold the
     ribbon.
 
+    With tiles_per_side = 1 the single tile is the whole periodic box: no
+    ribbon is stored (buffer_width must be 0) and a cell's padding is read
+    from the opposite side of the same tile, wrapping around the box. The
+    cells then load exactly the particles and seeds of mini-boxes of size
+    inner_cell_size with the same padding, so the catalogue equals the
+    mini-box pipeline's.
+
     Raises
     ------
     ValueError
         If tiles_per_side is < 1, if inner_cell_size <=0, if buffer_width < 0 
         or greater than the core size, if the ribbon is so wide that a tile would 
-        overlap itself across the periodic boundary, or if inner_cell_size does 
-        not divide the core size.
+        overlap itself across the periodic boundary, if tiles_per_side is 1 and
+        buffer_width is not 0, or if inner_cell_size does not divide the core
+        size.
     """
 
     boxsize: float          #global periodic box size, e.g. 1000.0 Mpc / h
@@ -48,12 +56,20 @@ class TileSpec:
             "inner_cell_size > 0.")
         if self.buffer_width < 0:
             raise ValueError("buffer_width must be >= 0.")
-        if self.buffer_width > self.core_size:
-            raise ValueError("buffer_width must not exceed the core size "
-                             "(boxsize / tiles_per_side).")
-        if self.core_size + 2 * self.buffer_width > self.boxsize:
-            raise ValueError("ribbon too wide: a tile would overlap itself "
-                             "across the periodic boundary.")
+        if self.tiles_per_side == 1:
+            # The one tile is the whole box: its neighbours are itself, so a
+            # ribbon would only duplicate its own rows.
+            if self.buffer_width != 0:
+                raise ValueError("with tiles_per_side = 1 the tile is the whole periodic "
+                                 "box and stores no ribbon: set buffer_width = 0 (the "
+                                 "padding wraps around the box).")
+        else:
+            if self.buffer_width > self.core_size:
+                raise ValueError("buffer_width must not exceed the core size "
+                                 "(boxsize / tiles_per_side).")
+            if self.core_size + 2 * self.buffer_width > self.boxsize:
+                raise ValueError("ribbon too wide: a tile would overlap itself "
+                                 "across the periodic boundary.")
         n_inner = self.core_size / self.inner_cell_size
         if abs(n_inner - round(n_inner)) > 1e-9:
             raise ValueError("inner_cell_size must divide the core size.")
@@ -117,6 +133,7 @@ def assign_to_tiles(pos: np.ndarray, spec: TileSpec):
     Every (row, tile) pair where the position lies in that tile's core or
     ribbon. Returns (rows, tiles, in_core); each row has exactly one in_core
     pair, plus one pair for each ribbon it falls in (up to 7 near corners).
+    With tiles_per_side = 1 every row is in the core of tile 0 and in no ribbon.
     
     """
     n, core, w = spec.tiles_per_side, spec.core_size, spec.buffer_width
@@ -126,6 +143,11 @@ def assign_to_tiles(pos: np.ndarray, spec: TileSpec):
         # Nothing to assign (e.g. an empty input chunk).
         return (np.empty(0, dtype = np.int64), np.empty(0, dtype = np.int64),
                 np.empty(0, dtype = bool))
+    if n == 1:
+        # Single periodic tile: no ribbon (a row at a core face would otherwise
+        # be copied into the tile's own "neighbour", i.e. itself).
+        return (np.arange(len(x), dtype=np.int64), np.zeros(len(x), dtype=np.int64),
+                np.ones(len(x), dtype=bool))
 
     i0 = np.minimum((x // core).astype(np.int64), n - 1)    # core tile per axis
     t = x - i0 * core                                       # position inside core

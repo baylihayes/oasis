@@ -9,13 +9,15 @@
 #   work_dir   folder for the box, the exported reference code and all outputs
 #              (created if needed; reused boxes are not regenerated)
 #   --tiled    additionally run the current code through the tiled pipeline
-#              (2 tiles per side) and require it to match the normal run
+#              (2 tiles per side, and a single tile for the whole box) and
+#              require both to match the normal run
 #
 # Checks:
 #   1. reference vs current with seed_tie_break='load_order' (the reference's
 #      order for seeds with equal M200b): must PASS in --mode reference.
-#   2. (--tiled) current mini-box run vs current tiled run, both with the
-#      default seed_tie_break='halo_id': must PASS in --mode tiled.
+#   2. (--tiled) current mini-box run vs current tiled runs (2 tiles per side,
+#      and 1 tile), all with the default seed_tie_break='halo_id': must PASS
+#      in --mode tiled.
 #   3. informational: how many haloes the default tie-break changes compared
 #      with the reference order (load_order vs halo_id). Never fails.
 #
@@ -69,7 +71,10 @@ run() {   # run <name> <package_dir> [extra args]
 run reference "$REF_PKG"
 run current_load_order "$REPO" --seed-tie-break load_order
 run current "$REPO"
-[[ "$TILED" == "--tiled" ]] && run current_tiled "$REPO" --tiles 2
+if [[ "$TILED" == "--tiled" ]]; then
+    run current_tiled "$REPO" --tiles 2
+    run current_one_tile "$REPO" --tiles 1
+fi
 
 # 4. Comparisons.
 status=0
@@ -78,6 +83,8 @@ python "$HERE/compare_runs.py" "$RUNS/reference" "$RUNS/current_load_order" --mo
 if [[ "$TILED" == "--tiled" ]]; then
     echo; echo "== 2. current mini-boxes vs current tiled (seed_tie_break=halo_id)"
     python "$HERE/compare_runs.py" "$RUNS/current" "$RUNS/current_tiled" --mode tiled || status=1
+    echo; echo "== 2b. current mini-boxes vs a single tile for the whole box"
+    python "$HERE/compare_runs.py" "$RUNS/current" "$RUNS/current_one_tile" --mode tiled || status=1
 fi
 echo; echo "== 3. informational: effect of the default tie-break (load_order -> halo_id)"
 python "$HERE/compare_runs.py" "$RUNS/current_load_order" "$RUNS/current" --count-only

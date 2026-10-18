@@ -41,15 +41,15 @@ def _make_box(seed = 0):
                 hid=np.arange(len(centers)), m200b=m200b, r200b=r200b,
                 rs=r200b / 5)
 
-def _write_box(path, d):
+def _write_box(path, d, minisize=MINI):
     process_simulation_data(
-        save_path=path, particle_type='seed', boxsize=BOX, minisize=MINI,
+        save_path=path, particle_type='seed', boxsize=BOX, minisize=minisize,
         positions=d['s_pos'].copy(), velocities=d['s_vel'].copy(), ids=d['hid'],
         mass=(d['m200b'], 'M200b'),
         data=([d['r200b'], d['rs']], ('R200b', 'Rs'), (np.float32, np.float32)),
         n_threads=1)
     process_simulation_data(
-        save_path=path, particle_type='dm', boxsize=BOX, minisize=MINI,
+        save_path=path, particle_type='dm', boxsize=BOX, minisize=minisize,
         positions=d['pos'].copy(), velocities=d['vel'].copy(), ids=d['pid'],
         mass=(MP, 'mass'), n_threads=1)
 
@@ -184,6 +184,11 @@ def test_catalogue_is_invariant_under_periodic_shift(tmp_path):
 # 2 tiles per side (core 50), ribbon = padding = 5, cells = mini-boxes = 25.
 TILE_SPEC = TileSpec(boxsize=BOX, tiles_per_side=2, buffer_width=PAD,
                      inner_cell_size=MINI)
+# One tile for the whole box: no ribbon, padding wraps around the box.
+ONE_TILE_SPEC = TileSpec(boxsize=BOX, tiles_per_side=1, buffer_width=0.0,
+                         inner_cell_size=MINI)
+SPECS = pytest.mark.parametrize("spec", [TILE_SPEC, ONE_TILE_SPEC],
+                                ids=["2_tiles_per_side", "1_tile"])
 
 def _build_tiles_from_box(d, out_dir, spec=TILE_SPEC):
     """Build tiles from the same synthetic box, with the same float32 types
@@ -196,12 +201,12 @@ def _build_tiles_from_box(d, out_dir, spec=TILE_SPEC):
     one_chunk = lambda arrays: (lambda: iter([arrays]))
     build_tiles(one_chunk(parts), one_chunk(seeds), out_dir, spec, particle_mass=MP)
 
-def _tile_sources(tile_dir, spec=TILE_SPEC):
-    return [BufferedTileDataSource(f'{tile_dir}/tile_{t}.hdf5', padding=PAD)
+def _tile_sources(tile_dir, spec=TILE_SPEC, padding=PAD):
+    return [BufferedTileDataSource(f'{tile_dir}/tile_{t}.hdf5', padding=padding)
             for t in range(spec.n_tiles)]
 
-def _matching_mini_box(tile, region):
-    return int(get_mini_box_id(tile.region_center(region).copy(), BOX, MINI))
+def _matching_mini_box(tile, region, minisize=MINI):
+    return int(get_mini_box_id(tile.region_center(region).copy(), BOX, minisize))
 
 def test_tile_regions_are_core_cells(tmp_path):
     _build_tiles_from_box(_make_box(), str(tmp_path))
@@ -225,16 +230,23 @@ def test_tile_source_rejects_padding_wider_than_ribbon(tmp_path):
     with pytest.raises(ValueError):
         BufferedTileDataSource(str(tmp_path / 'tile_0.hdf5'), padding=PAD + 1.0)
 
-def test_tile_source_serves_same_data_as_mini_boxes(tmp_path):
+@pytest.mark.parametrize("spec, minisize, padding", [
+    (TILE_SPEC, MINI, PAD),
+    (ONE_TILE_SPEC, MINI, PAD),
+    # 2 x 2 x 2 cells: wrapping reaches the same neighbour cell from both
+    # sides, which must be read once (as the mini-box loader does).
+    (TileSpec(boxsize=BOX, tiles_per_side=1, buffer_width=0.0, inner_cell_size=50.0), 50.0, PAD),
+], ids=["2_tiles_per_side", "1_tile", "1_tile_2_cells_per_side"])
+def test_tile_source_serves_same_data_as_mini_boxes(tmp_path, spec, minisize, padding):
     path = str(tmp_path) + '/'
     d = _make_box()
-    _write_box(path, d)                                   # mini-box files
-    _build_tiles_from_box(d, path + 'tiles')              # tiles of the same data
-    legacy = LegacyMiniBoxDataSource(path, BOX, MINI, 'dm', padding=PAD)
+    _write_box(path, d, minisize)                         # mini-box files
+    _build_tiles_from_box(d, path + 'tiles', spec)        # tiles of the same data
+    legacy = LegacyMiniBoxDataSource(path, BOX, minisize, 'dm', padding=padding)
     covered = []
-    for tile in _tile_sources(path + 'tiles'):
+    for tile in _tile_sources(path + 'tiles', spec, padding):
         for region in tile.region_ids():
-            box_id = _matching_mini_box(tile, region)
+            box_id = _matching_mini_box(tile, region, minisize)
             covered.append(box_id)
             a, b = legacy.load_seeds(box_id), tile.load_seeds(region)
             assert len(a) == len(b)
@@ -249,19 +261,20 @@ def test_tile_source_serves_same_data_as_mini_boxes(tmp_path):
                 np.testing.assert_array_equal(getattr(pa, name)[ia], getattr(pb, name)[ib])
             assert pa.mass == pb.mass
     # every mini-box is matched by exactly one tile core cell
-    assert sorted(covered) == list(range(int(BOX / MINI) ** 3))
+    assert sorted(covered) == list(range(int(BOX / minisize) ** 3))
 
-def test_classifier_on_tiles_matches_mini_boxes(tmp_path):
+@SPECS
+def test_classifier_on_tiles_matches_mini_boxes(tmp_path, spec):
     path = str(tmp_path) + '/'
     d = _make_box()
     _write_box(path, d)
-    _build_tiles_from_box(d, path + 'tiles')
+    _build_tiles_from_box(d, path + 'tiles', spec)
     calibrate(save_path=path, omega_m=0.3)
     kw = dict(min_num_part=10, boxsize=BOX, minisize=MINI, load_path=path,
               particle_type='dm', seed_prop_names=('M200b', 'R200b', 'Rs'),
               redshift=0.0, padding=PAD)
     n_haloes = 0
-    for tile in _tile_sources(path + 'tiles'):
+    for tile in _tile_sources(path + 'tiles', spec):
         for region in tile.region_ids():
             box_id = _matching_mini_box(tile, region)
             a = _classify_region(MiniBoxClassifier(mini_box_id=box_id, run_name='a', **kw))
@@ -279,19 +292,21 @@ def test_classifier_on_tiles_matches_mini_boxes(tmp_path):
             n_haloes += len(a.haloes_perc)
     assert n_haloes > 0
 
-def test_tiled_run_reproduces_untiled_run(tmp_path):
+@SPECS
+def test_tiled_run_reproduces_untiled_run(tmp_path, spec):
     """The whole tiled pipeline (tiles -> cells -> merge) must give exactly the
-    same catalogue and members as the normal mini-box pipeline."""
+    same catalogue and members as the normal mini-box pipeline, also with a
+    single tile for the whole box."""
     path = str(tmp_path) + '/'
     d = _make_box()
     _write_box(path, d)
-    _build_tiles_from_box(d, path + 'tiles')
+    _build_tiles_from_box(d, path + 'tiles', spec)
     calibrate(save_path=path, omega_m=0.3)
     common = dict(load_path=path, min_num_part=10, boxsize=BOX, padding=PAD,
                   particle_type='dm', redshift=0.0, n_threads=1)
     run_orbiting_mass_assignment(run_name='untiled', minisize=MINI, **common)
     run_tiled_orbiting_mass_assignment(
-        tile_paths=[path + f'tiles/tile_{t}.hdf5' for t in range(TILE_SPEC.n_tiles)],
+        tile_paths=[path + f'tiles/tile_{t}.hdf5' for t in range(spec.n_tiles)],
         run_name='tiled', **common)
     verify_catalogue(path, 'untiled')
   # The catalogue must be identical, including row order and index ranges.
@@ -332,3 +347,17 @@ def test_verify_catalogue_detects_duplicate_halo(tmp_path):
     merge_catalogues(load_path=load_path, run_name='t')
     with pytest.raises(ValueError, match="duplicate Halo_ID"):
         verify_catalogue(load_path, 't')
+
+def test_one_tile_needs_no_ribbon_and_allows_wider_padding(tmp_path):
+    """A single tile stores no ribbon (buffer_width must be 0) and its cells may
+    use any padding: it is read periodically from the same tile."""
+    with pytest.raises(ValueError, match="buffer_width = 0"):
+        TileSpec(boxsize=BOX, tiles_per_side=1, buffer_width=PAD, inner_cell_size=MINI)
+    assert ONE_TILE_SPEC.ring == 0 and ONE_TILE_SPEC.cells_per_side == int(BOX / MINI)
+    _build_tiles_from_box(_make_box(), str(tmp_path), ONE_TILE_SPEC)
+    with h5py.File(tmp_path / 'tile_0.hdf5') as f:
+        n_rows, ids = f['particles/pos'].shape[0], f['particles/ID'][()]
+        assert f['particles/in_core'][()].all()
+    assert n_rows == len(_make_box()['pid']) == len(np.unique(ids))   # no duplicates
+    tile = BufferedTileDataSource(str(tmp_path / 'tile_0.hdf5'), padding=2 * MINI)
+    assert tile.layers == 2 and len(tile.region_ids()) == int(BOX / MINI) ** 3

@@ -464,3 +464,14 @@ def test_interior_shortcut_matches_assign_to_tiles():
             rows, tiles, in_core = assign_to_tiles(pos, spec)
             np.testing.assert_array_equal(rows, np.arange(len(pos)))
             assert np.all(tiles == t) and in_core.all()
+
+
+def test_single_tile_assignment_has_no_ribbon_copies():
+    """With one tile every row, including rows exactly on the box faces, is in
+    the core of tile 0 exactly once."""
+    spec = TileSpec(boxsize=L, tiles_per_side=1, buffer_width=0.0, inner_cell_size=L / 4)
+    pos = wrap_positions(np.random.default_rng(8).uniform(0, L, (5000, 3)), L)
+    pos[:3] = 0.0                                   # rows on the lower faces
+    rows, tiles, in_core = assign_to_tiles(pos, spec)
+    np.testing.assert_array_equal(rows, np.arange(len(pos)))
+    assert np.all(tiles == 0) and in_core.all()

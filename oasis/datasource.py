@@ -151,7 +151,9 @@ class BufferedTileDataSource(SpatialDataSource):
         Tile file written by oasis.tiles.build_tiles().
     padding : float, default=5.0
         Distance around each core cell to load. Must not exceed the tile's
-        ribbon width (buffer_width).
+        ribbon width (buffer_width), except for a single tile covering the box
+        (tiles_per_side = 1), whose cells read their padding periodically from
+        the same tile.
     seed_prop_names : tuple of str, default=('M200b', 'R200b', 'Rs')
         Mass, radius and scale radius dataset names in the 'seeds' group.
 
@@ -161,7 +163,7 @@ class BufferedTileDataSource(SpatialDataSource):
     Raises
     ------
     ValueError
-        If padding is larger than the tile's buffer_width.
+        If padding is larger than the tile's buffer_width (tiles_per_side > 1).
     """
 
     def __init__(self, tile_path, padding = 5.0,
@@ -176,17 +178,20 @@ class BufferedTileDataSource(SpatialDataSource):
             self.buffer_width = float(meta['buffer_width'])
             self.ring = int(meta['ring'])
             self.m = int(meta['cells_per_side'])
+            # One tile for the whole box: neighbours wrap around the tile.
+            self.periodic = int(meta['tiles_per_side']) == 1
             core_min = np.asarray(meta['core_bounds'])[:,0]
             # stored as float32 like the minibox files, so Morb = N*m is
             # computed with the same precision as before
             self.particle_mass = (np.float32(meta['particle_mass'])
                                     if 'particle_mass' in meta else None)
             self._n_part_per_cell = np.diff(f['particles/cell_offset'][()])
-        if padding > self.buffer_width:
+        if padding > self.buffer_width and not self.periodic:
             raise ValueError(
                 f"padding ({padding}) is larger than tile's ribbon"
                 f" ({self.buffer_width}): rows near the core edge would be missing.")
-        # Neighbor layers needed to cover 'padding' (at most 'ring').
+        # Neighbor layers needed to cover 'padding' (at most 'ring', unless the
+        # tile is periodic).
         self.layers = int(np.ceil(padding / self.cell_size))
         # Global index of the tile's first core cell along each axis
         self._g0 = np.rint(core_min / self.cell_size).astype(np.int64)
@@ -237,20 +242,42 @@ class BufferedTileDataSource(SpatialDataSource):
         names = [n for n in group.keys() if n != 'cell_offset']
         pieces = {n: [] for n in names}
         own = []
-        for dz in range(-L, L + 1):
-            for dy in range(-L, L + 1):
+        for z in self._neighbours(k):
+            for y in self._neighbours(j):
                 # Cells next to each other in x are next to each other on disk,
-                # so each (dy, dz) row of 2L + 1 cells is one contiguous slice.
-                first = (i - L) + (j + dy) * m + (k + dz) * m**2
-                a, b = offsets[first], offsets[first + 2 * L + 1]
-                for n in names:
-                    pieces[n].append(group[n][a:b])
-                mask = np.zeros(b - a, dtype = bool)
-                if dy == 0 and dz == 0:
-                    mask[offsets[cell] - a:offsets[cell + 1] - a] = True
-                own.append(mask)
+                # so each run of consecutive x cells is one contiguous slice
+                # (one run per (y, z) row, two if a periodic tile wraps).
+                for x0, x1 in self._runs(self._neighbours(i)):
+                    first = x0 + y * m + z * m**2
+                    a, b = offsets[first], offsets[first + x1 - x0]
+                    for n in names:
+                        pieces[n].append(group[n][a:b])
+                    mask = np.zeros(b - a, dtype = bool)
+                    if y == j and z == k and x0 <= i < x1:
+                        mask[offsets[cell] - a:offsets[cell + 1] - a] = True
+                    own.append(mask)
         return ({n: np.concatenate(v) for n, v in pieces.items()},
                 np.concatenate(own))
+
+    def _neighbours(self, c):
+        """Local cell indices along one axis from c - layers to c + layers: in
+        the ribbon for a multi-tile run; wrapped around the box, each cell once,
+        for a single periodic tile (as the mini-box loader reads neighbours)."""
+        L = self.layers
+        if not self.periodic:
+            return list(range(c - L, c + L + 1))
+        return list(dict.fromkeys((c + d) % self.m for d in range(-L, L + 1)))
+
+    @staticmethod
+    def _runs(cells):
+        """Split cell indices into runs of consecutive cells: [(first, last + 1)]."""
+        runs = [[cells[0], cells[0] + 1]]
+        for c in cells[1:]:
+            if c == runs[-1][1]:
+                runs[-1][1] += 1
+            else:
+                runs.append([c, c + 1])
+        return [tuple(r) for r in runs]
 
     def _within_padding(self, pos, region_id):
         """Same cut as the minibox loader: |x - center| <= size / 2 + padding"""
