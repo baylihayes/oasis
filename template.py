@@ -28,22 +28,26 @@ from oasis.tiles import ChunkTasks, TileSpec, build_tiles
 #                               Simulation parameters
 #
 #   These are EXAMPLE values. Change them to your simulation parameters BEFORE
-#   running OASIS or you will get wrong results. Units only have to be
-#   consistent: here distances in Mpc/h, masses in Msun/h, velocities in km/s.
+#   running OASIS or you will get wrong results, especially for simulations with
+#   redshifts greater than 0. Units only have to be consistent: here distances
+#   in Mpc/h, masses in Msun/h, velocities in km/s.
 # ==============================================================================
 boxsize: float = 1000.                              # h^-1 Mpc
 particle_mass: float = 77546570000.0                # h^-1 M_sun
 redshift: float = 0.
 
 # Cosmological parameters.
-omega_m: float = 0.3                                # Omega_m at `redshift`
+omega_m0: float = 0.3                               # Omega_m today (z = 0)
 h: float = 0.67
+omega_m: float = (omega_m0 * (1 + redshift)**3      # Omega_m at `redshift`
+                  / (omega_m0 * (1 + redshift)**3 + 1 - omega_m0)) # (flat LambdaCDM)
 
-# This is an example for z = 0. Modify H(z)^2 accordingly or calculate the mass
-# density externally.
-Hz_sq: float = (100. * h)**2
-critical_density: float = 3. * Hz_sq / 8. / np.pi / G_GRAVITY  # h^2 M_sun / Mpc^3
-mass_density: float = omega_m * critical_density                # h^2 M_sun / Mpc^3
+# Mean matter density. OASIS works in comoving Mpc/h, so this is the z = 0 value
+# at any redshift: Omega_m0 * rho_crit,0. With H0 = 100 h km/s/Mpc, rho_crit,0
+# is in M_sun / Mpc^3; dividing by h^2 gives h^2 M_sun / Mpc^3.
+H0_sq: float = (100. * h)**2
+critical_density: float = 3. * H0_sq / 8. / np.pi / G_GRAVITY  # M_sun / Mpc^3
+mass_density: float = omega_m0 * critical_density / h**2        # h^2 M_sun / Mpc^3
 
 # ==============================================================================
 #
@@ -141,7 +145,7 @@ def calibration() -> None:
     # (omega_m is Omega_m at the snapshot's redshift).
     calibrate(
         save_path=save_path,
-        omega_m=omega_m,
+        omega_m=omega_m,                      # omega_m = Omega_m at `redshift`
     )
 
     # OPTION 2 ======================================================
