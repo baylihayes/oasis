@@ -361,3 +361,48 @@ def test_one_tile_needs_no_ribbon_and_allows_wider_padding(tmp_path):
     assert n_rows == len(_make_box()['pid']) == len(np.unique(ids))   # no duplicates
     tile = BufferedTileDataSource(str(tmp_path / 'tile_0.hdf5'), padding=2 * MINI)
     assert tile.layers == 2 and len(tile.region_ids()) == int(BOX / MINI) ** 3
+
+
+@SPECS
+def test_calibration_data_from_tiles_matches_mini_boxes(tmp_path, spec):
+    """Self-calibration data read from tiles (one tile, or several per side)
+    equals the data read from the mini-box files; only the row order may
+    differ (particles are loaded in another order)."""
+    from oasis.calibration import _select_candidate_seeds
+    path = str(tmp_path) + '/'
+    d = _make_box()
+    _write_box(path, d)
+    _build_tiles_from_box(d, path + 'tiles', spec)
+    kw = dict(n_seeds=20, seed_data=(d['s_pos'], d['s_vel'], d['m200b'], d['r200b']),
+              r_max=5.0, boxsize=BOX, minisize=MINI, load_path=path, particle_type='dm',
+              mass_density=MP * len(d['pid']) / BOX**3, redshift=0.0, n_threads=1)
+    a = _select_candidate_seeds(**kw)
+    b = _select_candidate_seeds(**kw, tile_paths=[path + f'tiles/tile_{t}.hdf5'
+                                                   for t in range(spec.n_tiles)])
+    assert len(a) > 0 and a.shape == b.shape
+    rows = lambda x: x[np.lexsort(x.T[::-1])]
+    np.testing.assert_array_equal(rows(a), rows(b))
+
+
+def test_calibration_from_tiles_rejects_mismatched_tiles(tmp_path):
+    """Tiles with another cell size, tiles that do not cover the seeds' cells,
+    or a ribbon narrower than the calibration padding are refused."""
+    from oasis.calibration import CALIBRATION_PADDING, _select_candidate_seeds
+    path = str(tmp_path) + '/'
+    d = _make_box()
+    _write_box(path, d)
+    kw = dict(n_seeds=20, seed_data=(d['s_pos'], d['s_vel'], d['m200b'], d['r200b']),
+              r_max=5.0, boxsize=BOX, minisize=MINI, load_path=path, particle_type='dm',
+              mass_density=MP * len(d['pid']) / BOX**3, redshift=0.0, n_threads=1)
+    _build_tiles_from_box(d, path + 'two', TILE_SPEC)
+    with pytest.raises(ValueError, match="no tile holds"):        # only one of 8 tiles
+        _select_candidate_seeds(**kw, tile_paths=[path + 'two/tile_0.hdf5'])
+    _build_tiles_from_box(d, path + 'big', TileSpec(boxsize=BOX, tiles_per_side=1,
+                                                    buffer_width=0.0, inner_cell_size=50.0))
+    with pytest.raises(ValueError, match="cell size"):
+        _select_candidate_seeds(**kw, tile_paths=[path + 'big/tile_0.hdf5'])
+    narrow = TileSpec(boxsize=BOX, tiles_per_side=2, buffer_width=CALIBRATION_PADDING / 2,
+                      inner_cell_size=MINI)
+    _build_tiles_from_box(d, path + 'narrow', narrow)
+    with pytest.raises(ValueError, match="padding"):
+        _select_candidate_seeds(**kw, tile_paths=[path + f'narrow/tile_{t}.hdf5' for t in range(8)])

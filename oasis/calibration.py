@@ -24,13 +24,14 @@ Two options:
     between 0.2 and 0.5 R200m, and its pivot is set so that 99.5% of positive-v_r particles lie below the
     line. The negative-v_r line has the same slope; its pivot value maximizes the mean squared
     perpendicular distance of the particles within a band of half-width w (scaled by 1 + z / 3)
-    around it. Reads particles from the mini-box files, so it is not available for tiled runs. 
+    around it. Reads the particles around the seeds from the mini-box files, or from tiles
+    (``tile_paths``; same calibration data, e.g. for a single tile covering the box).
     Optional diagnostic plots are saved to save_path.
 """
 
 import os
 from multiprocessing import Pool
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import h5py
 import numpy
@@ -48,6 +49,7 @@ from oasis.common import (G_GRAVITY, _validate_boxsize_minisize,
                           _validate_positive_number_non_zero,
                           _validate_seed_data)
 from oasis.coordinates import _periodic_displacement, velocity_components
+from oasis.datasource import BufferedTileDataSource
 from oasis.minibox import get_mini_box_id, load_particles
 
 __all__ = [
@@ -63,6 +65,10 @@ SIZE_LABELS: int = 16
 COLOR_BLUE = '#6591b5'
 COLOR_GRAY = '#808080'
 COLOR_RED = '#db715b'
+
+# Padding (Mpc/h) of the particle loads around each mini-box (or tile cell)
+# that holds calibration seeds; the mini-box loader's default.
+CALIBRATION_PADDING: float = 5.0
 
 
 def _compute_r200m_and_v200m(
@@ -194,6 +200,7 @@ def _get_candidate_seed_particle_data(
     particle_type: str,
     mass_density: float,
     redshift: float,
+    tile_path: Optional[str] = None,
 ) -> numpy.ndarray:
     r"""
     Extract and process particle data for all seeds within a single mini-box.
@@ -238,6 +245,9 @@ def _get_candidate_seed_particle_data(
     redshift : float
         Redshift of the snapshot. Particle velocities are stored as
         v_phys / sqrt(a) and are converted before use.
+    tile_path : str, optional
+        Tile file whose core holds this mini-box (cell); its particles are
+        read from the tile instead of the mini-box files. Default None.
 
     Returns
     -------
@@ -308,9 +318,18 @@ def _get_candidate_seed_particle_data(
     _validate_positive_number_non_zero(r_max, 'r_max')
     _validate_positive_number_non_zero(mass_density, 'rhom')
 
-    # Load particles in mini-box.
-    position_particles, velocity_particles, _, mass_particles = \
-        load_particles(mini_box_id, boxsize, minisize, load_path, particle_type)
+    # Load particles in the mini-box and its padding: from the mini-box files,
+    # or from the tile whose core holds this cell (cell IDs are mini-box IDs,
+    # and a tile cell loads exactly the particles of the same mini-box).
+    if tile_path is None:
+        position_particles, velocity_particles, _, mass_particles = load_particles(
+            mini_box_id, boxsize, minisize, load_path, particle_type,
+            padding=CALIBRATION_PADDING)
+    else:
+        particles = BufferedTileDataSource(
+            tile_path, padding=CALIBRATION_PADDING).load_particles(mini_box_id)
+        position_particles, velocity_particles, mass_particles = \
+            particles.pos, particles.vel, particles.mass
 
     # Periodic KD-tree over the particles, built once per mini-box. Candidates
     # are searched with a slightly larger radius, then the same cubic mask as
@@ -630,6 +649,48 @@ def _group_seeds_by_minibox(
     return minibox_groups
 
 
+def _tiles_by_cell(
+    tile_paths: Sequence[str],
+    boxsize: float,
+    minisize: float,
+) -> Dict[int, str]:
+    """
+    Map every cell (mini-box) ID to the tile whose core holds it.
+
+    Parameters
+    ----------
+    tile_paths : sequence of str
+        Tile files of one tiling of the box (see oasis.tiles.build_tiles).
+    boxsize, minisize : float
+        Box size and mini-box size; minisize must equal the tiles' inner cell
+        size, so cells and mini-boxes have the same IDs.
+
+    Returns
+    -------
+    dict
+        Cell ID -> tile path.
+
+    Raises
+    ------
+    ValueError
+        If a tile was built for another box size or cell size, if its ribbon
+        is narrower than CALIBRATION_PADDING (several tiles per side), or if
+        two tiles hold the same cell.
+    """
+    tile_of = {}
+    for path in tile_paths:
+        source = BufferedTileDataSource(path, padding=CALIBRATION_PADDING)
+        if source.boxsize != boxsize or source.cell_size != minisize:
+            raise ValueError(
+                f"{path} was built for boxsize {source.boxsize} and cell size "
+                f"{source.cell_size}, not boxsize {boxsize} and minisize {minisize}")
+        for region in source.region_ids():
+            if region in tile_of:
+                raise ValueError(f"cell {region} is in two tiles: {tile_of[region]}, {path}")
+            tile_of[region] = path
+    return tile_of
+
+
 def _select_candidate_seeds(
     n_seeds: int,
     seed_data: Tuple[numpy.ndarray],
@@ -643,6 +704,7 @@ def _select_candidate_seeds(
     isolation_factor: float = 0.2,
     isolation_radius_factor: float = 2.0,
     n_threads: Optional[int] = None,
+    tile_paths: Optional[Sequence[str]] = None,
 ) -> tuple[numpy.ndarray]:
     """
     Select isolated massive seeds and extract scaled particle data around them.
@@ -701,6 +763,13 @@ def _select_candidate_seeds(
     n_threads : int, optional
         Number of threads for parallel processing. If None, uses half of
         available CPU cores, capped by the number of mini-boxes to process.
+    tile_paths : sequence of str, optional
+        Tile files of the whole box (oasis.tiles.build_tiles), to read the
+        particles around the seeds from tiles instead of mini-box files. The
+        tiles' inner cell size must equal minisize, and with several tiles per
+        side their ribbon must be at least CALIBRATION_PADDING (5 Mpc/h). Gives
+        the same calibration data as the mini-box files (rows may be in a
+        different order). Default None: mini-box files.
 
     Returns
     -------
@@ -800,6 +869,16 @@ def _select_candidate_seeds(
     minibox_groups = _group_seeds_by_minibox(
         position, velocity, boxsize, minisize)
 
+    # With tiles, each mini-box's particles are read from the tile holding it.
+    if tile_paths is not None:
+        tile_of = _tiles_by_cell(tile_paths, boxsize, minisize)
+        missing = sorted(set(minibox_groups) - set(tile_of))
+        if missing:
+            raise ValueError(f"no tile holds cells {missing[:10]}: pass the tiles "
+                             "of the whole box")
+    else:
+        tile_of = {}
+
     # Cap the number of threads to the total number of mini-boxes to process
     n_miniboxes = len(minibox_groups)
     if n_threads is None:
@@ -811,7 +890,7 @@ def _select_candidate_seeds(
     # Set up multiprocessing
     processing_args = [
         (minibox_id, position_group, velocity_group, r_max, boxsize, minisize,
-         load_path, particle_type, mass_density, redshift)
+         load_path, particle_type, mass_density, redshift, tile_of.get(minibox_id))
         for minibox_id, (position_group, velocity_group) in minibox_groups.items()
     ]
 
@@ -1003,6 +1082,7 @@ def get_calibration_data(
     n_threads: Optional[int] = None,
     diagnostics: bool = True,
     overwrite: bool = False,
+    tile_paths: Optional[Sequence[str]] = None,
 ) -> Tuple[numpy.ndarray]:
     """
     Generate or load calibration data from isolated massive seed halos.
@@ -1061,6 +1141,13 @@ def get_calibration_data(
         Default is True.
     overwrite : bool, optional
         Whether to overwrite the existing calibration data. Default is False.
+    tile_paths : sequence of str, optional
+        Tile files of the whole box (oasis.tiles.build_tiles), to read the
+        particles around the seeds from tiles instead of mini-box files. The
+        tiles' inner cell size must equal minisize, and with several tiles per
+        side their ribbon must be at least CALIBRATION_PADDING (5 Mpc/h). Gives
+        the same calibration data as the mini-box files (rows may be in a
+        different order). Default None: mini-box files.
 
     Returns
     -------
@@ -1171,6 +1258,7 @@ def get_calibration_data(
             isolation_factor=isolation_factor,
             isolation_radius_factor=isolation_radius_factor,
             n_threads=n_threads,
+            tile_paths=tile_paths,
         )
 
         radius = results[:, 0]
@@ -2324,6 +2412,7 @@ def self_calibration(
     n_threads: Optional[int] = None,
     diagnostics: bool = True,
     overwrite: bool = False,
+    tile_paths: Optional[Sequence[str]] = None,
 ) -> None:
     """
     Runs calibration from isolated halo samples.
@@ -2410,7 +2499,14 @@ def self_calibration(
         Default is True. Plots saved to save_path.
     overwrite : bool, optional
         Whether to overwrite the existing calibration data. Default is False.
- 
+    tile_paths : sequence of str, optional
+        Tile files of the whole box (oasis.tiles.build_tiles), to read the
+        particles around the seeds from tiles instead of mini-box files. The
+        tiles' inner cell size must equal minisize, and with several tiles per
+        side their ribbon must be at least CALIBRATION_PADDING (5 Mpc/h). Gives
+        the same calibration data as the mini-box files (rows may be in a
+        different order). Default None: mini-box files.
+
     Returns
     -------
     None
@@ -2542,6 +2638,7 @@ def self_calibration(
         isolation_radius_factor=isolation_radius_factor,
         diagnostics=diagnostics,
         overwrite=overwrite,
+        tile_paths=tile_paths,
     )
 
     mask_negative_vr = (radial_velocity < 0)
@@ -2736,6 +2833,8 @@ def calibrate(
         - particle_type : str - Particle type
         - mass_density : float - Mean matter density
         - redshift : float - Simulation redshift
+        Optional: tile_paths (read the particles from tiles instead of
+        mini-box files).
         See self_calibration docstring for complete parameter descriptions.
 
     Returns
