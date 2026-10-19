@@ -1,8 +1,8 @@
 """Template file for running OASIS: Orbiting mAss asSIngment Scheme
 
 All loading of simulation data and catalogues is left to the user (functions
-`particle_data` and `seed_data` below), to avoid dependencies specific to any
-simulation. OASIS then runs in three steps:
+`read_particle_file` and `read_seed_file` below, each reading one file), to
+avoid dependencies specific to any simulation. OASIS then runs in three steps:
 
 1. Build tiles: the box is stored as tiles_per_side**3 tile files, each split
    into inner cells of size inner_cell_size. For a box that fits in memory use
@@ -21,7 +21,7 @@ import numpy as np
 from oasis.calibration import calibrate
 from oasis.catalogue import run_tiled_orbiting_mass_assignment
 from oasis.common import G_GRAVITY, ensure_dir_exists, timer
-from oasis.tiles import TileSpec, array_chunks, build_tiles
+from oasis.tiles import ChunkTasks, TileSpec, build_tiles
 
 # ==============================================================================
 #
@@ -91,38 +91,45 @@ tile_paths = [save_path + f'tiles/tile_{t}.hdf5' for t in range(spec.n_tiles)]
 #                               OASIS sample run
 #
 # ==============================================================================
-def seed_data() -> tuple[np.ndarray]:
-    # LOAD YOUR DATA HERE: positions, velocities, M200b, R200b, IDs and NFW
-    # scale radii of the halo seeds (e.g. a Rockstar catalogue).
-    pos, vel, m200b, r200b, hid, rs = ()
-    return pos, vel, m200b, r200b, hid, rs
+# Your input files. Simulations usually come in many files (e.g. one GADGET
+# snapshot split into hundreds of files); OASIS reads them one at a time, so
+# the box never has to fit in memory. A single file per list also works.
+particle_files: list[str] = []      # e.g. sorted(glob.glob('/path/snapdir_000/snap_000.*'))
+seed_files: list[str] = []          # e.g. ['/path/rockstar/halos_0.hdf5']
 
 
-def particle_data() -> tuple[np.ndarray]:
-    # LOAD YOUR DATA HERE: IDs, positions and velocities of the particles.
-    # Velocities must be v_phys / sqrt(a) (GADGET convention).
+# The two readers below must stay at the top level of this file (not inside
+# another function), so that the worker processes of build_tiles can call them.
+def read_particle_file(path: str) -> dict:
+    # LOAD YOUR DATA HERE: IDs, positions and velocities of the particles in
+    # the file `path`. Velocities must be v_phys / sqrt(a) (GADGET convention).
     pid, pos, vel = ()
-    return pid, pos, vel
+    return dict(ID=pid, pos=pos, vel=np.asarray(vel, np.float32))
+
+
+def read_seed_file(path: str) -> dict:
+    # LOAD YOUR DATA HERE: IDs, positions, velocities, M200b, R200b and NFW
+    # scale radii of the halo seeds in the file `path` (e.g. a Rockstar
+    # catalogue).
+    hid, pos, vel, m200b, r200b, rs = ()
+
+    # Stored as float32, like the mini-box files of earlier versions.
+    f32 = np.float32
+    return dict(ID=hid, pos=pos, vel=np.asarray(vel, f32), M200b=np.asarray(m200b, f32),
+                R200b=np.asarray(r200b, f32), Rs=np.asarray(rs, f32))
 
 
 @timer(fancy=False)
 def make_tiles() -> None:
-    # Load your data.
-    pos, vel, m200b, r200b, hid, rs = seed_data()
-    pid, ppos, pvel = particle_data()
-
-    # Stored as float32, like the mini-box files of earlier versions.
-    f32 = np.float32
-    seeds = dict(ID=hid, pos=pos, vel=np.asarray(vel, f32), M200b=np.asarray(m200b, f32),
-                 R200b=np.asarray(r200b, f32), Rs=np.asarray(rs, f32))
-    particles = dict(ID=pid, pos=ppos, vel=np.asarray(pvel, f32))
-
-    # Data already in memory is passed in chunks with array_chunks. For data
-    # too large for memory, pass a chunk factory that reads one file at a time
-    # instead (see oasis.tiles.ChunkTasks); then n_workers > 1 reads files in
-    # parallel. Use tile_ids=[...] to build a large box in groups of tiles.
-    build_tiles(array_chunks(particles), array_chunks(seeds), save_path + 'tiles',
-                spec, particle_mass=particle_mass, n_workers=8)
+    # ChunkTasks(reader, files) gives build_tiles one file at a time, read as
+    # reader(file). With n_workers > 1, that many files are read in parallel,
+    # so memory grows with n_workers times the size of one file; the tiles
+    # are the same for any n_workers. Use tile_ids=[...] to build a large box
+    # in groups of tiles. (Arrays already in memory can be passed with
+    # oasis.tiles.array_chunks(dict_of_arrays) instead of ChunkTasks.)
+    build_tiles(ChunkTasks(read_particle_file, particle_files),
+                ChunkTasks(read_seed_file, seed_files),
+                save_path + 'tiles', spec, particle_mass=particle_mass, n_workers=8)
     return None
 
 
@@ -141,8 +148,10 @@ def calibration() -> None:
     # Calibrate on the simulation's own isolated haloes, reading the particles
     # around them from the tiles. Use one option or the other.
 
-    # # Load your data. No `rs` needed here.
-    # pos, vel, m200b, r200b, _, _ = seed_data()
+    # # All seeds at once (seeds are small next to the particles).
+    # seeds = [read_seed_file(f) for f in seed_files]
+    # pos, vel, m200b, r200b = (np.concatenate([s[k] for s in seeds])
+    #                           for k in ('pos', 'vel', 'M200b', 'R200b'))
     # calibrate(
     #     save_path=save_path,
     #     omega_m=None,                       # None selects self-calibration

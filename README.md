@@ -60,22 +60,28 @@ where $R_{s}$ is the NFW scale radius, and $M_{\rm 200b}$ is [<span style="font-
 
 > Velocities are assumed to be physical velocities scaled by the scale factor $a$, like $v_{\rm phys}/\sqrt{a}$. The kinetic energy $T\sim a^{-2}$ so that $\ln\left(a^2v^2/v_{\rm 200m}\right) - r/R_{\rm 200m}$ space is within a fixed range. Please make sure the input velocities are in this convention.
 
-The data are passed to `build_tiles` in chunks, so the whole box never has to be in memory. Data already in memory is chunked with `array_chunks`:
+The data are passed to `build_tiles` one file at a time, so the whole box never has to be in memory. You write one function that reads a single particle file and one that reads a single seed file, each returning a dictionary of arrays, and `ChunkTasks` applies them to your lists of files:
 ```python
 import numpy as np
-from oasis.tiles import TileSpec, array_chunks, build_tiles
+from oasis.tiles import ChunkTasks, TileSpec, build_tiles
+
+def read_particle_file(path):
+    pid, pos, vel = ...         # load one file
+    return dict(ID=pid, pos=pos, vel=np.asarray(vel, np.float32))
+
+def read_seed_file(path):
+    hid, pos, vel, m200b, r200b, rs = ...         # load one file
+    f32 = np.float32
+    return dict(ID=hid, pos=pos, vel=np.asarray(vel, f32), M200b=np.asarray(m200b, f32),
+                R200b=np.asarray(r200b, f32), Rs=np.asarray(rs, f32))
 
 spec = TileSpec(boxsize=boxsize, tiles_per_side=1, buffer_width=0.,
                 inner_cell_size=inner_cell_size)
-f32 = np.float32
-particles = dict(ID=pid, pos=pos, vel=vel.astype(f32))
-seeds = dict(ID=hid, pos=s_pos, vel=s_vel.astype(f32), M200b=m200b.astype(f32),
-             R200b=r200b.astype(f32), Rs=rs.astype(f32))
-
-build_tiles(array_chunks(particles), array_chunks(seeds), save_path + 'tiles', spec,
-            particle_mass=particle_mass, n_workers=8)
+build_tiles(ChunkTasks(read_particle_file, particle_files),
+            ChunkTasks(read_seed_file, seed_files),
+            save_path + 'tiles', spec, particle_mass=particle_mass, n_workers=8)
 ```
-For data too large for memory, pass a chunk factory that reads one file at a time instead, e.g. `oasis.tiles.ChunkTasks(read_one_file, list_of_files)`; then `n_workers > 1` reads the files in parallel. Large boxes can be built in groups of tiles with `tile_ids=[...]`. Existing mini-box files of earlier versions are converted with `oasis.minibox.minibox_chunks`.
+With `n_workers > 1`, that many files are read in parallel. The readers must be defined at the top level of a module, not inside another function, so that the worker processes can call them. Data already in memory can be passed with `oasis.tiles.array_chunks(dict_of_arrays)` instead of `ChunkTasks`. Large boxes can be built in groups of tiles with `tile_ids=[...]`. Existing mini-box files of earlier versions are converted with `oasis.minibox.minibox_chunks`.
 
 The tiles need about the same disk space as the input data (plus the ribbons), and temporary files of the same size while they are built.
 
