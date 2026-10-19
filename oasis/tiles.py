@@ -510,10 +510,15 @@ def build_tile(bucket_path: str, tile_path: str, tile_id: int, spec: TileSpec,
         blocks = [slice(a, min(a + rows_per_block, n_rows))
                   for a in range(0, n_rows, rows_per_block)]
 
-        counts = np.zeros(m3, dtype = np.int64)         # pass 1: rows per cell
+        # Pass 1: rows per cell. Each block's cell IDs are kept for pass 2, in
+        # the smallest integer type that holds them (a stable sort of int16 is
+        # a radix sort, much faster than for int64; the order is the same).
+        cell_dtype = np.int16 if m3 <= np.iinfo(np.int16).max else np.int32
+        counts = np.zeros(m3, dtype = np.int64)
+        cells = []
         for b in blocks:
-            counts += np.bincount(local_cell_ids(src['pos'][b], tile_id, spec),
-                                minlength = m3)
+            cells.append(local_cell_ids(src['pos'][b], tile_id, spec).astype(cell_dtype))
+            counts += np.bincount(cells[-1], minlength = m3)
 
         offsets = np.concatenate(([0], np.cumsum(counts)))
 
@@ -532,11 +537,11 @@ def build_tile(bucket_path: str, tile_path: str, tile_id: int, spec: TileSpec,
         grp.create_dataset('cell_offset', data = offsets)
 
         cursor = offsets[:-1].copy()
-        for b in blocks:                                  # pass 2: fill cell slices
-            cell = local_cell_ids(src['pos'][b], tile_id, spec)
+        for b, cell in zip(blocks, cells):                # pass 2: fill cell slices
             order = np.argsort(cell, kind = 'stable')
             cell = cell[order]
-            data = {k: src[k][b][order] for k in src.keys()}
+            # np.take reorders rows faster than fancy indexing (same result).
+            data = {k: np.take(src[k][b], order, axis = 0) for k in src.keys()}
             starts = np.searchsorted(cell, np.arange(m3 + 1))
             for c in np.flatnonzero(np.diff(starts)):
                 lo, hi = starts[c], starts[c+1]
