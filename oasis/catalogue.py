@@ -346,7 +346,10 @@ class MiniBoxClassifier:
         """Distance from the substructure where the host's and the
         substructure's NFW densities are equal (6D-ball radius, before the
         cap at the substructure's R200b), using self.ball_radius_solver."""
-        args = (delta1, rs1, delta2, rs2, r12)
+
+        # Python floats, so the density difference is evaluated in float64 (with
+        # float32 seed properties, NumPy would otherwise compute it in float32).
+        args = tuple(float(v) for v in (delta1, rs1, delta2, rs2, r12))
         if self.ball_radius_solver == 'brentq':
             # The density difference rises monotonically from -inf (at the
             # substructure) to +inf (at the host), so the root in (0, r12) is
