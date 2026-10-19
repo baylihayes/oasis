@@ -406,3 +406,56 @@ def test_calibration_from_tiles_rejects_mismatched_tiles(tmp_path):
     _build_tiles_from_box(d, path + 'narrow', narrow)
     with pytest.raises(ValueError, match="padding"):
         _select_candidate_seeds(**kw, tile_paths=[path + f'narrow/tile_{t}.hdf5' for t in range(8)])
+
+
+def test_array_chunks_build_the_same_tiles(tmp_path):
+    """Tiles built with array_chunks (any chunk size) are identical to tiles
+    built from the arrays in one chunk."""
+    from oasis.tiles import array_chunks
+    d = _make_box()
+    _build_tiles_from_box(d, str(tmp_path / 'one'), ONE_TILE_SPEC)
+    f32 = np.float32
+    parts = dict(ID=d['pid'], pos=d['pos'], vel=d['vel'].astype(f32))
+    seeds = dict(ID=d['hid'], pos=d['s_pos'], vel=d['s_vel'].astype(f32),
+                 M200b=d['m200b'].astype(f32), R200b=d['r200b'].astype(f32),
+                 Rs=d['rs'].astype(f32))
+    build_tiles(array_chunks(parts, chunk_rows=7000), array_chunks(seeds, chunk_rows=3),
+                str(tmp_path / 'chunked'), ONE_TILE_SPEC, particle_mass=MP)
+    with h5py.File(tmp_path / 'one/tile_0.hdf5') as a, h5py.File(tmp_path / 'chunked/tile_0.hdf5') as b:
+        for group in ('particles', 'seeds'):
+            assert set(a[group]) == set(b[group])
+            for k in a[group]:
+                np.testing.assert_array_equal(a[group][k][()], b[group][k][()], err_msg=f'{group}/{k}')
+    with pytest.raises(ValueError):
+        array_chunks(dict(pos=np.zeros((3, 3)), ID=np.arange(2)))
+
+
+@pytest.mark.parametrize("n_workers", [1, 2])
+def test_tiles_from_mini_box_files_reproduce_the_mini_box_run(tmp_path, n_workers):
+    """Existing mini-box files converted to one tile (minibox_chunks) give the
+    same catalogue and members as running OASIS on the mini-box files."""
+    from oasis.minibox import minibox_chunks, minibox_particle_mass
+    path = str(tmp_path) + '/'
+    d = _make_box()
+    _write_box(path, d)
+    mass = minibox_particle_mass(path, BOX, MINI)
+    assert mass == float(np.float32(MP))
+    build_tiles(minibox_chunks(path, BOX, MINI, 'dm'), minibox_chunks(path, BOX, MINI, 'seed'),
+                path + 'tiles', ONE_TILE_SPEC, particle_mass=mass, n_workers=n_workers)
+    calibrate(save_path=path, omega_m=0.3)
+    common = dict(load_path=path, min_num_part=10, boxsize=BOX, padding=PAD,
+                  particle_type='dm', redshift=0.0, n_threads=1)
+    run_orbiting_mass_assignment(run_name='minibox', minisize=MINI, **common)
+    run_tiled_orbiting_mass_assignment(tile_paths=[path + 'tiles/tile_0.hdf5'],
+                                       run_name='tile', **common)
+    with h5py.File(path + 'run_minibox/catalogue.hdf5') as a, \
+            h5py.File(path + 'run_tile/catalogue.hdf5') as b:
+        assert len(a['Halo_ID']) > 0
+        for key in a:
+            np.testing.assert_array_equal(a[key][()], b[key][()], err_msg=key)
+        lidx, ridx = a['LIDX'][()], a['RIDX'][()]
+    with h5py.File(path + 'run_minibox/members.hdf5') as a, \
+            h5py.File(path + 'run_tile/members.hdf5') as b:
+        pa, pb = a['PID'][()], b['PID'][()]
+        for lo, hi in zip(lidx, ridx):
+            np.testing.assert_array_equal(np.sort(pa[lo:hi]), np.sort(pb[lo:hi]))

@@ -1,7 +1,7 @@
 import os
 from functools import partial
 from multiprocessing import Pool
-from warnings import filterwarnings
+import warnings
 import hashlib
 import json
 import socket
@@ -19,8 +19,6 @@ from oasis.common import G_GRAVITY, ensure_dir_exists, StageTimer
 from oasis.coordinates import _periodic_displacement
 from oasis.datasource import (BufferedTileDataSource, LegacyMiniBoxDataSource, 
                               SpatialDataSource)
-
-filterwarnings('ignore')
 
 
 
@@ -357,8 +355,13 @@ class MiniBoxClassifier:
             if (r12 > 0 and self._rho_nfw_roots(lo, *args) < 0
                     and self._rho_nfw_roots(hi, *args) > 0):
                 return float(brentq(self._rho_nfw_roots, lo, hi, args=args))
-        # Original solver, started at half the distance between the seeds.
-        return float(fsolve(func=self._rho_nfw_roots, x0=0.5*r12, args=args)[0])
+        # Original solver, started at half the distance between the seeds. Its
+        # warnings (no convergence, invalid values once it steps below zero)
+        # are the known divergence described in ball_radius_solver, so they
+        # are silenced here only.
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            return float(fsolve(func=self._rho_nfw_roots, x0=0.5*r12, args=args)[0])
 
     def _load_particles(self):
         """Load the particles for this region (core plus padding) from the data source.
@@ -1029,7 +1032,11 @@ class MiniBoxClassifier:
 
         if results:
             df = pandas.DataFrame(results)
-            self.haloes = pandas.concat([self.haloes, df], ignore_index=True)
+            # The rows have exactly the table's columns, in the same order, so
+            # an empty table is replaced instead of concatenated (same frame,
+            # without pandas' FutureWarning about empty entries).
+            self.haloes = (df if self.haloes.empty else
+                           pandas.concat([self.haloes, df], ignore_index=True))
         
         # Sort haloes by their orbiting mass. With constant particle mass, 
         # Morb = Norb * m_p, so equal Morb is common, and the order of equal
@@ -1855,6 +1862,10 @@ def run_orbiting_mass_assignment(
     ball_radius_solver: str = 'fsolve',
 ) -> None:
     """Generate complete halo catalog using kinetic energy classification.
+
+    Runs OASIS on mini-box files (or a given data source). New runs should use
+    tiles (run_tiled_orbiting_mass_assignment, or process_tile and
+    merge_tiled_run); a single tile for the whole box gives the same catalogue.
 
     This is the main entry point for the halo finding pipeline. It orchestrates
     mini-box processing, catalog merging, and optional cleanup of intermediate

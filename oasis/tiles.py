@@ -271,6 +271,44 @@ def _interior_tile(pos: np.ndarray, spec: TileSpec):
     return int(i_lo[0] + i_lo[1] * n + i_lo[2] * n**2)
 
 
+def array_chunks(arrays: dict, chunk_rows: int = 10_000_000) -> ChunkFactory:
+    """
+    Chunk factory over arrays that are already in memory.
+
+    Parameters
+    ----------
+    arrays : dict
+        Column name -> array, all of the same length, with at least 'pos'
+        (n, 3); e.g. dict(ID=..., pos=..., vel=...) for particles, plus the
+        seed properties ('M200b', 'R200b', 'Rs') for seeds.
+    chunk_rows : int, default=10_000_000
+        Rows per chunk (bounds the memory used while building tiles).
+
+    Returns
+    -------
+    callable
+        Returns a new iterator over chunks (slices of the arrays) each call,
+        as build_tiles requires.
+
+    Raises
+    ------
+    ValueError
+        If 'pos' is missing or the arrays have different lengths.
+    """
+    if 'pos' not in arrays:
+        raise ValueError("arrays must contain 'pos'")
+    n = len(arrays['pos'])
+    if any(len(v) != n for v in arrays.values()):
+        raise ValueError("all arrays must have the same length")
+    if chunk_rows < 1:
+        raise ValueError("chunk_rows must be >= 1")
+
+    def make():
+        for a in range(0, n, chunk_rows):
+            yield {k: v[a:a + chunk_rows] for k, v in arrays.items()}
+    return make
+
+
 def _rows_for_tiles(pos: np.ndarray, spec: TileSpec, wanted: np.ndarray):
     """(rows, tiles, in_core) of one chunk's wrapped positions, as from
     assign_to_tiles on the pre-filtered rows (rows index the chunk)."""

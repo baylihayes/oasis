@@ -7,6 +7,12 @@ halo catalogs) holding 'ID', 'pos', 'vel', the mass and any extra properties.
 
 Mini-box IDs are id = ix + iy*n + iz*n**2, where (ix, iy, iz) are the cell
 indicies along the x, y, z axes and n is the number of cells per side. 
+
+New runs should use the tiled workflow (oasis.tiles.build_tiles): one tile per
+side with buffer_width = 0 gives the same catalogue without writing mini-box
+files and without holding the whole box in memory. The functions here remain
+for existing mini-box data and for reproducing the original OASIS;
+minibox_chunks converts existing mini-box files to tiles.
 """
 
 import os
@@ -30,6 +36,8 @@ __all__ = [
     'process_simulation_data',
     'load_particles',
     'load_seeds',
+    'minibox_chunks',
+    'minibox_particle_mass',
 ]
 
 
@@ -488,6 +496,11 @@ def process_simulation_data(
 ) -> None:
     """
     Validate and process simulation particle data before saving.
+
+    Kept for existing workflows and for reproducing the original OASIS. New
+    runs should build tiles instead (oasis.tiles.build_tiles; tiles_per_side=1
+    and buffer_width=0 give the same catalogue), which streams the data and
+    never holds the whole box in memory.
 
     Parameters
     ----------
@@ -953,3 +966,78 @@ def load_seeds(
     mini_box_mask = mini_box_mask[argorder]
 
     return positions, velocities, ids, r200, m200, rs, mini_box_mask
+
+
+
+# Converting existing mini-box data to tiles ----------------------------------
+
+def _mini_box_files(load_path, boxsize, minisize):
+    """Paths of the mini-box files of a box, in mini-box ID order."""
+    n = int(numpy.ceil(boxsize / minisize))
+    folder = Path(load_path) / f'mini_boxes_nside_{n}'
+    if not folder.is_dir():
+        raise FileNotFoundError(f"no mini-box folder {folder}")
+    return [str(folder / f'{i}.hdf5') for i in range(n**3)
+            if (folder / f'{i}.hdf5').exists()]
+
+
+def _read_mini_box_group(task):
+    """One mini-box file's rows of one group as a chunk (module level, so
+    oasis.tiles.build_tiles can read files in worker processes)."""
+    path, group = task
+    with h5py.File(path, 'r') as f:
+        g = f[group]
+        n = g['pos'].shape[0]
+        # Per-row datasets only: a constant particle mass is stored as a
+        # scalar and is passed to build_tiles separately.
+        return {k: g[k][()] for k in g if g[k].shape[:1] == (n,)}
+
+
+def minibox_chunks(load_path: str, boxsize: float, minisize: float,
+                   particle_type: str):
+    """
+    Chunk factory over existing mini-box files, one file per chunk, to build
+    tiles from mini-box data (e.g. when the original snapshot is gone).
+
+    Parameters
+    ----------
+    load_path : str
+        Folder that holds mini_boxes_nside_<n>/ (n = ceil(boxsize / minisize)).
+    boxsize, minisize : float
+        Box and mini-box sizes the files were written with.
+    particle_type : str
+        Group to read: 'dm' for particles, 'seed' for seeds.
+
+    Returns
+    -------
+    oasis.tiles.ChunkTasks
+        For oasis.tiles.build_tiles; files are read in parallel with
+        build_tiles(..., n_workers > 1). For particles, pass the constant
+        particle mass separately (minibox_particle_mass).
+
+    Notes
+    -----
+    Tiles with tiles_per_side=1, buffer_width=0 and inner_cell_size=minisize
+    built from these chunks give the same catalogue as the mini-box files.
+    """
+    from oasis.tiles import ChunkTasks      # tiles does not import minibox
+    files = []
+    for path in _mini_box_files(load_path, boxsize, minisize):
+        with h5py.File(path, 'r') as f:
+            if particle_type in f:          # e.g. a mini-box without seeds
+                files.append(path)
+    if not files:
+        raise ValueError(f"no '{particle_type}' data in the mini-box files of {load_path}")
+    return ChunkTasks(_read_mini_box_group, [(p, particle_type) for p in files])
+
+
+def minibox_particle_mass(load_path: str, boxsize: float, minisize: float,
+                          particle_type: str = 'dm') -> float:
+    """Constant particle mass stored in a box's mini-box files (as float32,
+    the value OASIS used), or None if the mass is stored per particle."""
+    for path in _mini_box_files(load_path, boxsize, minisize):
+        with h5py.File(path, 'r') as f:
+            if particle_type in f and 'mass' in f[particle_type]:
+                mass = f[particle_type]['mass']
+                return float(mass[()]) if mass.shape == () else None
+    raise ValueError(f"no '{particle_type}/mass' in the mini-box files of {load_path}")
