@@ -3,4 +3,11 @@ channels:
   - conda-forge
 dependencies:
   - python>=3.10
-  - mpi4py
+  - numpy
+  - scipy
+  - pandas
+  - h5py
+  - tqdm
+  - matplotlib
+  - pytest
+  - pip

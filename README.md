@@ -16,14 +16,16 @@ When using this code please cite Salazar et. al. (2025) ([arXiv:XXXX.XXXX]()).
     - [Members catalogue](#halo-members-catalogue)
 
 ## Requirements
-Create a conda environment. An `environment.yml` file is supplied as an example but feel free to use your own. It must include `mpi4py` and `python>=3.10`.
+Create a conda environment. An `environment.yml` file is supplied as an example but feel free to use your own. It needs Python 3.10 or later with `numpy`, `scipy`, `pandas`, `h5py`, `tqdm`, and `matplotlib`; `pip` installs them with <span style="font-variant:small-caps;">Oasis</span> if they are missing.
 ```sh
 $ conda env create -f environment.yml
+$ conda activate oasis
 ```
 Alternatively
 ```sh
-$ conda create --name <env name> python=3.10 mpi4py
+$ conda create --name <env name> python=3.10 numpy scipy pandas h5py tqdm matplotlib
 ```
+Reading compressed HDF5 snapshots (e.g. Quijote) may also need [`hdf5plugin`](https://github.com/silx-kit/hdf5plugin), imported in your own reading code.
 
 ## Installation
 Build from source
@@ -31,6 +33,11 @@ Build from source
 $ git clone https://github.com/edgarmsalazar/oasis.git
 $ cd oasis
 $ python -m pip install .
+```
+To run the tests (about 3 minutes):
+```sh
+$ python -m pip install ".[test]"
+$ python -m pytest test
 ```
 
 ## Usage
