@@ -1,10 +1,32 @@
-"""Build core+ribbon tiles for very large simulations (MDPL2)
+"""Build core+ribbon tiles that OASIS reads seeds and particles from.
 
 The box is split into tiles_per_side**3 cubic cores. Each tile stores the rows
-of its core plus a ribbon of width 'buffer_width' around it, always in global
-coordinates (nothing is shifted or wrapped per tile). Inside a tile, rows are
-grouped by inner cell, with an offset table so a cell is one contiguous slice.
+of its core plus a ribbon of width 'buffer_width' around it (copies of neighboring
+tiles' rows), so each tile can be processed on its own. All rows are in global 
+coordinates (nothing is shifted or wrapped per tile). With tiles_per_side = 1 
+the single tile is the whole periodic box: there is no ribbon and a cell's padding 
+wraps around the box. This is the usual choice for a box that fits in memory, and 
+gives the same catalog as the mini-box workflow of earlier versions.
 
+Inside a tile, rows are grouped by inner cell (cubes of size inner_cell_size), with an 
+offset table so a cell is one contiguous slice. Tiles are built by build_tiles from 
+chunk factories: ChunkTasks(load, files) to read the input in chunks usually the size 
+of one particle file (in parallel with n_workers > 1), or array_chunks(arrays) for 
+data already in memory.
+
+Tile file layout (tile_<id>.hdf5)
+---------------------------------
+particles/, seeds/
+    ID, pos (n, 3) float32, vel (n, 3) float32 (as given, v_sim = v_phys / sqrt(a)), 
+    and other input columns (seeds: M200b, R200b, Rs; for particles: a per-particle 
+    'mass' if no particle_mass is given).
+    in_core (n,) bool: True if rows are located within the core of the tile. False if 
+    located in the ribbon around the tile.
+    cell_offset (cells_per_side**3 + 1,): the rows of local cell c in the tile file are 
+    cell_offset[c]:cell_offset[c+1].
+tile_metadata (attributes)
+    global_boxsize, tiles_per_side, tile_id, tile_index, core_bounds, buffer_width, 
+    inner_cell_size, cells_per_side, ring, and particle_mass if it was given.
 """
 import os
 from collections import deque
@@ -35,20 +57,34 @@ class TileSpec:
     inner_cell_size with the same padding, so the catalogue equals the
     mini-box pipeline's.
 
+    Parameters
+    ----------
+    boxsize : float
+        The length of one side of the whole simulation box.
+    tiles_per_side : int
+        Number of tiles along each axis (tiles_per_side**3 tiles).
+    buffer_width : float
+        Ribbon width around each tile core (copies of neighboring tiles' rows);
+        must be at least the padding used to process tiles. 0 with 
+        tiles_per_side = 1.
+    inner_cell_size : float
+        The length of one side of the cells within each tile. Must divide into
+        boxsize / tiles_per_side evenly. 
+
     Raises
     ------
     ValueError
-        If tiles_per_side is < 1, if inner_cell_size <=0, if buffer_width < 0 
+        If tiles_per_side is < 1, if inner_cell_size <= 0, if buffer_width < 0 
         or greater than the core size, if the ribbon is so wide that a tile would 
         overlap itself across the periodic boundary, if tiles_per_side is 1 and
         buffer_width is not 0, or if inner_cell_size does not divide the core
         size.
     """
 
-    boxsize: float          #global periodic box size, e.g. 1000.0 Mpc / h
-    tiles_per_side: int     # e.g. 5 -> 125 tiles
-    buffer_width: float     # ribbon width w
-    inner_cell_size: float # e.g. 25.0 Mpc / h
+    boxsize: float
+    tiles_per_side: int
+    buffer_width: float
+    inner_cell_size: float
 
     def __post_init__(self):
         if self.tiles_per_side < 1 or self.inner_cell_size <= 0:
@@ -76,42 +112,37 @@ class TileSpec:
 
     @property
     def core_size(self) -> float:
+        """Side length of one tile's core, boxsize / tiles_per_side."""
         return self.boxsize / self.tiles_per_side
 
     @property
     def n_tiles(self) -> int:
+        """Number of tiles in the simulation box, tiles_per_side**3."""
         return self.tiles_per_side**3
 
     @property
     def ring(self) -> int:
-        """
-        Inner cells added on each side of the core to hold the ribbon.
-    
-        """
+        """Inner cells added on each side of the core to hold the ribbon."""
         return int(np.ceil(self.buffer_width / self.inner_cell_size))
 
     @property
     def cells_per_side(self) -> int:
+        """Inner cells per side of a tile: core cells plus 'ring' cells on each
+        side for the ribbon."""
         return int(round(self.core_size / self.inner_cell_size)) + 2 * self.ring
 
     def tile_index(self, tile_id: int) -> np.ndarray:
-        """
-        (ix, iy, iz) of a tile; x varies the fastest, as for the minibox IDs.
-    
-        """
+        """(ix, iy, iz) of a tile; x varies the fastest, as for the minibox IDs."""
         n = self.tiles_per_side
         return np.array([tile_id % n, (tile_id // n) % n, tile_id // n**2])
 
     def core_bounds(self, tile_id: int) -> np.ndarray:
-        """
-        [[xmin,xmax], [ymin,ymax],[zmin, zmax]] of the tile's core.
-    
-        """
+        """[[xmin,xmax], [ymin,ymax],[zmin, zmax]] of the tile's core."""
         lo = self.tile_index(tile_id) * self.core_size
         return np.stack([lo, lo+self.core_size], axis=1)
 
 
-#Below are the functions to assign rows to tiles.
+# --- Assigning rows to tiles and inner cells --- 
 
 def wrap_positions(pos: np.ndarray, boxsize: float) -> np.ndarray:
     """
@@ -186,7 +217,23 @@ def assign_to_tiles(pos: np.ndarray, spec: TileSpec):
 def local_cell_ids(pos: np.ndarray, tile_id: int, spec: TileSpec) -> np.ndarray:
     """
     Inner-cell index within one tile for positions in its core or ribbon.
+
+    Cells are numbered i + j * m + k * m**2 with m = spec.cells_per_side 
+    (ring cells included), so x varies fastest.
+
+    Parameters
+    ----------
+    pos : numpy.ndarray
+        Positions in global coordinates, shape (n, 3).
+    tile_id : int
+        Tile the positions belong to.
+    spec : TileSpec
+        Tiling geometry.
     
+    Returns
+    -------
+    numpy.ndarray
+        Local cell index of each row, shape (n,).
     """
     L, w, m = spec.boxsize, spec.buffer_width, spec.cells_per_side
     core_min = spec.core_bounds(tile_id)[:,0]
@@ -201,8 +248,8 @@ def local_cell_ids(pos: np.ndarray, tile_id: int, spec: TileSpec) -> np.ndarray:
 
 
 
-# Below is where the tiles are written
-# Stage 1
+# --- Building tiles: input chunks, then one bucket file per tile --- 
+
 ChunkFactory = Callable[[], Iterator[dict]]     # returns a new iterator each call
 
 
@@ -213,6 +260,24 @@ class ChunkTasks:
     used anywhere a plain chunk factory is accepted; build_tiles(n_workers > 1)
     reads and assigns several chunks at once. ``load`` must be a module-level
     function (it is sent to worker processes), e.g. one snapshot file per task.
+
+    Parameters
+    ----------
+    load : callable
+        load(task) -> dict of equal-length arrays with at least 'ID', 'pos' (n, 3)
+        and 'vel' (n, 3) plus the seed properties for the seeds. Must be defined at 
+        the top level of the module (not inside another function) so that worker 
+        processes can call it.
+    tasks : iterable
+        One item per chunk, passed to load (e.g. file paths).
+
+    Examples
+    --------
+    >>> def read_snapshot_file(path):
+    ...     with h5py.File(path, 'r') as f:
+    ...         return dict(ID=f['ID'][()], pos=f['pos'][()], vel=f['vel'][()])
+    >>> particles = ChunkTasks(read_snapshot_file, sorted(glob.glob('snap_*.hdf5')))
+    >>> build_tiles(particles, seeds, 'tiles/', spec, particle_mass=m_p, n_workers=8)
     """
     def __init__(self, load: Callable[[object], dict], tasks):
         self.load = load
@@ -405,7 +470,7 @@ def _in_order(fn, jobs, n_workers):
             yield pending.popleft().result()
 
 
-def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
+def _bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
                       kind: str, tile_ids = None, n_workers: int = 1) -> np.ndarray:
     """
     Stream input chunks into one unsorted bucket file per tile.
@@ -486,8 +551,9 @@ def bucket_into_tiles(make_chunks: ChunkFactory, out_dir: str, spec: TileSpec,
             f.close()
     return counts
 
-# Stage 2: sort one tile's bucket by inner cell and write the tile file
-def build_tile(bucket_path: str, tile_path: str, tile_id: int, spec: TileSpec,
+# --- Building tiles: sorting a tile's bucket into cells (the tile file) ---
+
+def _build_tile(bucket_path: str, tile_path: str, tile_id: int, spec: TileSpec,
                kind: str, rows_per_block: int = 50_000_000,
                attrs: dict | None = None) -> None:
     """
@@ -630,15 +696,16 @@ def build_tiles(make_particle_chunks: ChunkFactory, make_seed_chunks: ChunkFacto
                            n_workers)
         return
 
-    bucket_into_tiles(make_particle_chunks, out_dir, spec, 'particles', tile_ids,
-                      n_workers=n_workers)
-    bucket_into_tiles(make_seed_chunks, out_dir, spec, 'seeds', tile_ids,
+    _bucket_into_tiles(make_particle_chunks, out_dir, spec, 'particles', tile_ids,
+                     n_workers=n_workers)
+    _bucket_into_tiles(make_seed_chunks, out_dir, spec, 'seeds', tile_ids,
                       n_workers=n_workers)
     # Each tile is sorted into its own file, so tiles can be sorted in parallel.
     jobs = [(out_dir, t, spec, attrs, keep_buckets) for t in tile_ids]
     for _ in _in_order(_sort_tile_task, jobs, min(n_workers, len(jobs))):
         pass
 
+# --- One tile per side: rows written straight into the tile ---
 
 def _cell_dtype(spec: TileSpec):
     """Smallest integer type holding the cell IDs of a tile (a stable sort of
@@ -685,7 +752,7 @@ def _write_single_tile(make_chunks: ChunkFactory, tile_path: str, spec: TileSpec
     Writes group 'kind' of the tile file of a one-tile box straight from the
     input chunks, without bucket files. Pass 1 counts the rows per cell; pass 2
     writes each chunk's rows, sorted by cell, after the rows of earlier chunks
-    in the same cell. The file is identical to bucket_into_tiles + build_tile.
+    in the same cell. The file is identical to _bucket_into_tiles + _build_tile.
     """
     m3 = spec.cells_per_side**3
     parallel = n_workers > 1 and isinstance(make_chunks, ChunkTasks)
@@ -711,7 +778,7 @@ def _write_single_tile(make_chunks: ChunkFactory, tile_path: str, spec: TileSpec
     with h5py.File(tile_path, 'a') as dst:
         if kind in dst:
             raise FileExistsError(f"{tile_path} already contains a '{kind}' group.")
-        # Same metadata, datasets and order of writes as build_tile, so the
+        # Same metadata, datasets and order of writes as _build_tile, so the
         # file is identical (datasets in name order, like a bucket file's keys).
         meta = dst.require_group('tile_metadata')
         meta.attrs.update(dict(
@@ -744,6 +811,6 @@ def _sort_tile_task(args):
     tile_path = os.path.join(out_dir, f'tile_{t}.hdf5')
     for kind in ('particles', 'seeds'):
         bucket = os.path.join(out_dir, f'bucket_{kind}_{t}.hdf5')
-        build_tile(bucket, tile_path, t, spec, kind, attrs=attrs)
+        _build_tile(bucket, tile_path, t, spec, kind, attrs=attrs)
         if not keep_buckets:
             os.remove(bucket)

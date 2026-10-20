@@ -479,9 +479,9 @@ def test_single_tile_assignment_has_no_ribbon_copies():
 
 def _bucket_build_single_tile(parts, seeds, out_dir, spec, attrs):
     """The one-tile build through bucket files (the multi-tile path)."""
-    from oasis.tiles import _sort_tile_task, bucket_into_tiles
-    bucket_into_tiles(parts, out_dir, spec, 'particles', [0])
-    bucket_into_tiles(seeds, out_dir, spec, 'seeds', [0])
+    from oasis.tiles import _sort_tile_task, _bucket_into_tiles
+    _bucket_into_tiles(parts, out_dir, spec, 'particles', [0])
+    _bucket_into_tiles(seeds, out_dir, spec, 'seeds', [0])
     _sort_tile_task((out_dir, 0, spec, attrs, False))
 
 
