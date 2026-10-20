@@ -46,7 +46,7 @@ $ python -m pytest test
 A [template](template.py) file is provided as an example of how to use the code. It consists of three basic steps: building tiles from the simulation data, calibrating, and finding haloes.
 
 ### User parameters
-The choice of units is not strict to the ones shown below. However, it must be consistent across all quantities with the same physical dimensions. For example, if the units for the `boxsize` are in $h^{-1}{\rm Mpc}$, then all distances, positions and radii must also be provided in $h^{-1}{\rm Mpc}$.
+The choice of units is not strict to the ones shown below. However, it must be consistent across all quantities with the same physical dimensions. For example, if the units for the `boxsize` are in $h^{-1}{\rm Mpc}$, then all distances, positions and radii must also be provided in $h^{-1}{\rm Mpc}$. All lengths are comoving: positions, $R_{\rm 200b}$, $R_s$, `boxsize`, `padding` and `r_max` in comoving $h^{-1}{\rm Mpc}$ (in this example), and `mass_density` is the comoving mean matter density, i.e. its $z = 0$ value at any redshift. Note that <span style="font-variant:small-caps;">Rockstar</span> gives $R_s$ and $R_{\rm vir}$ in comoving $h^{-1}{\rm kpc}$: divide them by 1000.
 
 - `boxsize`: side length of the simulation box in units of $h^{-1}{\rm Mpc}$.
 - `tiles_per_side`: the box is stored as `tiles_per_side`$^3$ tile files. Use `1` for a box that fits in memory; large boxes (e.g. MDPL2) use several tiles per side, each built and processed on its own.

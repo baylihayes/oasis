@@ -114,7 +114,9 @@ def read_particle_file(path: str) -> dict:
 def read_seed_file(path: str) -> dict:
     # LOAD YOUR DATA HERE: IDs, positions, velocities, M200b, R200b and NFW
     # scale radii of the halo seeds in the file `path` (e.g. a Rockstar
-    # catalogue).
+    # catalogue). Positions, R200b and Rs in comoving Mpc/h, like boxsize
+    # (Rockstar's Rs is in comoving kpc/h: divide it by 1000).
+
     hid, pos, vel, m200b, r200b, rs = ()
 
     # Stored as float32, like the mini-box files of earlier versions.
