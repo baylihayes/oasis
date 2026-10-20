@@ -3,7 +3,7 @@
 The box is split into ceil(boxsize / minisize)**3 mini-boxes. Each mini-box is
 one HDF5 file, save_path/mini_boxes_nside_<n>/<id>.hdf5, with one group per 
 particle type (e.g. 'dm' for particles, 'seed' for halo seeds from ROCKSTAR 
-halo catalogs) holding 'ID', 'pos', 'vel', the mass and any extra properties.
+halo catalogues) holding 'ID', 'pos', 'vel', the mass and any extra properties.
 
 Mini-box IDs are id = ix + iy*n + iz*n**2, where (ix, iy, iz) are the cell
 indicies along the x, y, z axes and n is the number of cells per side. 
@@ -683,7 +683,7 @@ def load_particles(
     OSError
         If HDF5 files cannot be read or are corrupted.
     ValueError
-        If no file of the mini-box or its neighbours contains particle_type,
+        If no file of the mini-box or its  neighbors contains particle_type,
         or if they contain no rows at all. (If rows exist but none lie within
         the padding, empty arrays are returned.)
 
@@ -695,7 +695,7 @@ def load_particles(
     Notes
     -----
     - Uses periodic boundary conditions when calculating relative coordinates
-    - Reads the target mini-box and its 26 neighbours, each file once (fewer
+    - Reads the target mini-box and its 26  neighbors, each file once (fewer
       files when the grid has fewer than 3 cells per side)
     - Mini-boxes without a file (nothing in them) and files without
       particle_type (e.g. seeds only) are skipped
@@ -718,7 +718,7 @@ def load_particles(
     _validate_inputs_load(mini_box_id, boxsize, minisize, load_path, padding)
 
     # Get the adjacent mini-box IDs. With fewer than 3 cells per side the same
-    # neighbour appears several times; load each mini-box only once.
+    #  neighbor appears several times; load each mini-box only once.
     mini_box_ids = _unique_in_order(get_adjacent_mini_box_ids(
         mini_box_id=mini_box_id,
         boxsize=boxsize,
@@ -739,13 +739,13 @@ def load_particles(
     n_loaded = 0
     n_with_type = 0
 
-    # The minibox folder must exist (a missing folder means a wrong
+    # The mini-box folder must exist (a missing folder means a wrong
     # load_path or minisize, not an empty region).
     box_dir = Path(load_path) / f'mini_boxes_nside_{cells_per_side}'
     if not box_dir.is_dir():
         raise FileNotFoundError(f"Minibox folder not found: {box_dir}")
 
-    # Load all adjacent boxes. Miniboxes with nothing in them have no file,
+    # Load all adjacent boxes. Mini-boxes with nothing in them have no file,
     # and a file may hold seeds but no particles of this type; both are 
     # skipped. Any other read error is raised.
     for mini_box in mini_box_ids:
@@ -873,7 +873,7 @@ def load_seeds(
     OSError
         If HDF5 files cannot be read or are corrupted.
     ValueError
-        If the mini-box and its neighbours contain no rows at all. (If rows
+        If the mini-box and its  neighbors contain no rows at all. (If rows
         exist but none lie within the padding, empty arrays are returned.)
 
     See Also
@@ -906,7 +906,7 @@ def load_seeds(
     label_m200, label_r200, label_rs = seed_prop_names
 
     # Get the adjacent mini-box IDs. With fewer than 3 cells per side the same
-    # neighbour appears several times; load each mini-box only once.
+    #  neighbor appears several times; load each mini-box only once.
     mini_box_ids = _unique_in_order(get_adjacent_mini_box_ids(
         mini_box_id=mini_box_id,
         boxsize=boxsize,

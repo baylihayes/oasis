@@ -538,7 +538,7 @@ def _find_isolated_seeds(
         isolation_radius = isolation_radii[i]
         max_neighbor_mass = max_neighbor_masses[i]
 
-        # Use a KDTree to find neighbouring seeds.
+        # Use a KDTree to find neighboring seeds.
         idx_neighbor = position_tree.query_ball_point(current_position, 
                                                       isolation_radius,
                                                       p=numpy.inf,
@@ -611,7 +611,7 @@ def _group_seeds_by_minibox(
 
     Notes
     -----
-    - Minibox IDs are computed using spatial hashing of seed coordinates
+    - Mini-box IDs are computed using spatial hashing of seed coordinates
     - Empty mini-boxes (containing no seeds) are not included in the result
     - Seeds exactly on mini-box boundaries are assigned consistently
     - Memory usage scales linearly with the number of seeds
@@ -629,7 +629,7 @@ def _group_seeds_by_minibox(
     ... )
     >>> print(f"Seeds distributed across {len(groups)} mini-boxes")
     >>> for box_id, (pos, vel) in groups.items():
-    ...     print(f"Minibox {box_id}: {len(pos)} seeds")
+    ...     print(f"Mini-box {box_id}: {len(pos)} seeds")
     """
     # Validate inputs
     _validate_coordinate_array(position, 'position')
@@ -710,7 +710,7 @@ def _select_candidate_seeds(
     Select isolated massive seeds and extract scaled particle data around them.
 
     This function identifies the most massive isolated seeds from the input
-    catalog and loads particles within r_max of each seed to compute r/R200m and 
+    catalogue and loads particles within r_max of each seed to compute r/R200m and 
     kinetic energy. Only seeds that dominate their local environment are 
     considered (isolation criterion: all neighbors within 2*R200m must have
     mass < 0.2*M200 of the seed).
@@ -911,7 +911,7 @@ def _select_candidate_seeds(
             print(
                 f"Warning: Parallel processing failed ({e}), falling back to sequential")
             # Discard anything in the pool returned before failing, so the
-            # sequential pass below does not add those miniboxes a second time.
+            # sequential pass below does not add those mini-boxes a second time.
             results = []
             # Fall back to sequential processing
             n_threads = 1
@@ -2576,7 +2576,7 @@ def self_calibration(
     --------
     >>> import numpy as np
     >>> 
-    >>> # Prepare seed catalog from halo finder
+    >>> # Prepare seed catalogue from halo finder
     >>> positions = np.random.uniform(0, 100, (1000, 3))
     >>> velocities = np.random.normal(0, 200, (1000, 3))
     >>> masses = np.random.lognormal(30, 1, 1000)
@@ -2826,10 +2826,10 @@ def calibrate(
         Ignored when using cosmology-based calibration. Required parameters for
         self-calibration include:
         - n_seeds : int - Number of halos for calibration
-        - seed_data : tuple - Halo catalog data
+        - seed_data : tuple - Halo catalogue data
         - r_max : float - Maximum radius for particle selection
         - boxsize : float - Simulation box size
-        - minisize : float - Minibox size
+        - minisize : float - Mini-box size
         - particle_type : str - Particle type
         - mass_density : float - Mean matter density
         - redshift : float - Simulation redshift
@@ -2911,7 +2911,7 @@ def calibrate(
     >>> # Example 2: Self-calibration from simulation data
     >>> import numpy as np
     >>> 
-    >>> # Prepare halo catalog
+    >>> # Prepare halo catalogue
     >>> positions = np.random.uniform(0, 100, (1000, 3))
     >>> velocities = np.random.normal(0, 200, (1000, 3))
     >>> masses = np.random.lognormal(30, 1, 1000)

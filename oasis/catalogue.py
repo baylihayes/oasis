@@ -313,7 +313,7 @@ class MiniBoxClassifier:
     def _build_seed_tree(self):
         """Build a periodic KD-tree over the seed positions once per mini-box.
 
-        Used by `_apply_6d_ball` to find candidate neighbouring seeds instead
+        Used by `_apply_6d_ball` to find candidate neighboring seeds instead
         of computing distances to every seed for every halo. Candidate searches
         use a radius enlarged by `self._search_margin`; the original float32
         distance cut is then applied to the candidates, so the selected seeds

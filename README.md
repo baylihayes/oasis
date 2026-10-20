@@ -55,7 +55,7 @@ The choice of units is not strict to the ones shown below. However, it must be c
 - `particle_mass`: dark matter particle mass in units of $h^{-1} M_{\odot}$.
 - `save_path`: path to the directory where <span style="font-variant:small-caps;">Oasis</span> will save all data products.
 
-With `tiles_per_side=1` and `buffer_width=0`, the catalogue is identical to the mini-box workflow of earlier <span style="font-variant:small-caps;">Oasis</span> versions with `minisize = inner_cell_size` and the same `padding`. The catalogue does not depend on `inner_cell_size`: larger cells are faster (fewer seeds are processed twice in neighbouring cells' padding) but use more memory per worker.
+With `tiles_per_side=1` and `buffer_width=0`, the catalogue is identical to the mini-box workflow of earlier <span style="font-variant:small-caps;">Oasis</span> versions with `minisize = inner_cell_size` and the same `padding`. The catalogue does not depend on `inner_cell_size`: larger cells are faster (fewer seeds are processed twice in neighboring cells' padding) but use more memory per worker.
 
 ### Step 1: Build tiles
 <span style="font-variant:small-caps;">Oasis</span> does not assume any type or form of data storage format like Gadget, HDF, or any other, and leaves the task of loading data to the user. This is to avoid adding dependencies specific to any simulation and keeping the API simple and lightweight. The input data must include:

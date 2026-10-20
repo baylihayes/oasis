@@ -396,11 +396,11 @@ def _validate_boxsize_minisize(boxsize: float | int, minisize: float | int) -> N
     ValueError
         If boxsize is negative or zero.
     TypeError
-        If minibox size is not numeric
+        If mini-box size is not numeric
     ValueError
-        If minibox size is negative or zero.
+        If mini-box size is negative or zero.
     ValueError
-        If minibox size is larger than the boxsize. 
+        If mini-box size is larger than the boxsize. 
     
     """
     # Validate both are positive numbers
@@ -420,18 +420,18 @@ def _validate_mini_box_id(mini_box_id: int | numpy.integer, cells_per_side: int 
     Parameters
     ----------
     mini_box_id : int | numpy.integer
-        The ID of the minibox.
+        The ID of the mini-box.
     cells_per_side : int | numpy.integer
         Number of cells that fit along one length of the simulation box.
     
     Raises
     ------
     TypeError
-        If minibox ID is not an integer.
+        If mini-box ID is not an integer.
     TypeError
-        If the minibox ID is not numeric.
+        If the mini-box ID is not numeric.
     ValueError
-        If the minibox ID is negative.
+        If the mini-box ID is negative.
     TypeError
         If the number of cells per side is not an integer.
     ValueError
@@ -528,24 +528,24 @@ def _validate_inputs_load(
     Parameters
     ----------
     mini_box_id : int
-        The ID of the minibox.
+        The ID of the mini-box.
     boxsize : float
         The side length of the simulation box.
     minisize : float
-        The side length of a minibox inside the simulation box.
+        The side length of a mini-box inside the simulation box.
     load_path : str
         The path where the simulation data is stored and will be loaded from.
     padding : float
-        The length of the padding on the edges of the miniboxes. 
+        The length of the padding on the edges of the mini-boxes. 
 
     Raises
     ------
     TypeError
-        If minibox ID is not an integer.
+        If mini-box ID is not an integer.
     TypeError
-        If the minibox ID is not numeric.
+        If the mini-box ID is not numeric.
     ValueError
-        If the minibox ID is negative.
+        If the mini-box ID is negative.
     ValueError
         If the mini box ID exceeds the maximum number of cells within a cubic 
         grid with a total mini box number of cells_per_side**3.
@@ -554,11 +554,11 @@ def _validate_inputs_load(
     ValueError
         If boxsize is negative or zero.
     TypeError
-        If minibox size is not numeric
+        If mini-box size is not numeric
     ValueError
-        If minibox size is negative or zero.
+        If mini-box size is negative or zero.
     ValueError
-        If minibox size is larger than the boxsize.
+        If mini-box size is larger than the boxsize.
     TypeError
         If load_path is not a string or Path instance.
     FileNotFoundError
@@ -585,7 +585,7 @@ def _validate_seed_data(
     Parameters
     ----------
     seed_data : Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, numpy.ndarray]
-        The position, velocity, M200b, and R200b from the seed halo catalog.
+        The position, velocity, M200b, and R200b from the seed halo catalogue.
 
     Raises
     ------

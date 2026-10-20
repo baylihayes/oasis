@@ -7,12 +7,12 @@ core + ribbon tiles), so the science stays the same.
 
 - BufferedTileDataSource: a core cell of a tile built by oasis.tiles.build_tiles
   (the current workflow), read with its neighboring cells.
-- LegacyMiniBoxDataSource: a mini-box file written by 
+- LegacyMiniBoxDataSource: a mini-box file written by
   oasis.minibox.process_simulation_data (the workflow of earlier versions),
   read with its 26 neighboring mini-boxes.
 
 Both return the same SeedSet and ParticleSet for that same region, so one
-tile per side replicates the mini-box workflow catalog exactly.
+tile per side replicates the mini-box workflow catalogue exactly.
 """
 
 from abc import ABC, abstractmethod
@@ -49,7 +49,7 @@ class SeedSet:
 @dataclass
 class ParticleSet:
     """
-    Particles around one region, in global coordinates. Velocities are as 
+    Particles around one region, in global coordinates. Velocities are as
     stored in the simulation (v_sim = v_phys / sqrt(a)). The classifier converts
     them to the appropriate units.
     """
@@ -118,7 +118,7 @@ class LegacyMiniBoxDataSource(SpatialDataSource):
     seed_prop_names : tuple of str, default=('M200b', 'R200b', 'Rs')
         Mass, radius and scale radius dataset names in the 'seed' group.
     padding : float, default=5.0
-        The distance around each mini-box from which particles and 
+        The distance around each mini-box from which particles and
         seeds will be loaded from neighboring mini-boxes.
     """
     def __init__(self, load_path, boxsize, minisize, particle_type,
@@ -139,7 +139,7 @@ class LegacyMiniBoxDataSource(SpatialDataSource):
         n_regions = self.cells_per_side**3
         counts = np.zeros(n_regions, dtype = np.int64)
         for box_id in range(n_regions):
-            file_name = (self.load_path + 
+            file_name = (self.load_path +
                         f'mini_boxes_nside_{self.cells_per_side}/{box_id}.hdf5')
             try:
                 with h5py.File(file_name, 'r') as hdf:
@@ -163,12 +163,12 @@ class LegacyMiniBoxDataSource(SpatialDataSource):
 class BufferedTileDataSource(SpatialDataSource):
     """
     Serves the inner cells of one prebuilt core + ribbon tile (see oasis.tiles).
-    
+
     Regions are the tile's CORE cells, identified by their GLOBAL cell ID (the
     same number a mini-box of size inner_cell_size would have), so region IDs
-    never clash between tiles. Each region is a cell plus 'padding', read from 
-    the cell and its neighbors with direct slices (rows are grouped by cell, 
-    see 'cell_offset'). Ribbon cells are only ever read as neighbors, never 
+    never clash between tiles. Each region is a cell plus 'padding', read from
+    the cell and its neighbors with direct slices (rows are grouped by cell,
+    see 'cell_offset'). Ribbon cells are only ever read as neighbors, never
     processed as regions.
 
     Parameters
@@ -187,7 +187,7 @@ class BufferedTileDataSource(SpatialDataSource):
     ------
     ValueError
         If padding is larger than the tile's buffer_width (tiles_per_side > 1).
-    
+
     Notes
     -----
     The particle mass is read from the tile metadata (as float32, like the
@@ -206,7 +206,7 @@ class BufferedTileDataSource(SpatialDataSource):
             self.buffer_width = float(meta['buffer_width'])
             self.ring = int(meta['ring'])
             self.m = int(meta['cells_per_side'])
-            # One tile for the whole box: neighbours wrap around the tile.
+            # One tile for the whole box: neighbors wrap around the tile.
             self.periodic = int(meta['tiles_per_side']) == 1
             core_min = np.asarray(meta['core_bounds'])[:,0]
             # stored as float32 like the mini-box files, so Morb = N*m is
@@ -233,7 +233,7 @@ class BufferedTileDataSource(SpatialDataSource):
         return np.array([cell % m , (cell // m) % m, cell // m**2])
 
     def region_center(self, region_id):
-        """Center of a core cell in global coordinates, computed with the same 
+        """Center of a core cell in global coordinates, computed with the same
         formula as the mini-box loader: (global cell index + 0.5) * size."""
         n = self.n_global
         g = np.array([region_id % n, (region_id // n) % n, region_id // n**2])
@@ -253,7 +253,7 @@ class BufferedTileDataSource(SpatialDataSource):
         ijk = g - self._g0 + self.ring
         if np.any(ijk < self.ring) or np.any(ijk >= m - self.ring):
             raise ValueError(f"region {region_id} is not a core cell of {self.tile_path}")
-        return int(ijk[0] + ijk[1] * m + ijk[2] * m**2)        
+        return int(ijk[0] + ijk[1] * m + ijk[2] * m**2)
 
     def region_ids_by_workload(self):
         ids = np.array(self.region_ids())
@@ -262,7 +262,7 @@ class BufferedTileDataSource(SpatialDataSource):
 
     # -- reading ----------------------------------------------------------
     def _read(self, group, cell):
-        """Rows of 'cell' and its neighbors (self.layers deep), and a mask of 
+        """Rows of 'cell' and its neighbors (self.layers deep), and a mask of
         the rows that belong to 'cell' itself."""
         i, j, k = self._ijk(cell)
         m = self.m
@@ -290,7 +290,7 @@ class BufferedTileDataSource(SpatialDataSource):
     def _neighbours(self, c):
         """Local cell indices along one axis from c - layers to c + layers: in
         the ribbon for a multi-tile run; wrapped around the box, each cell once,
-        for a single periodic tile (as the mini-box loader reads neighbours)."""
+        for a single periodic tile (as the mini-box loader reads neighbors)."""
         L = self.layers
         if not self.periodic:
             return list(range(c - L, c + L + 1))
@@ -328,7 +328,7 @@ class BufferedTileDataSource(SpatialDataSource):
         with h5py.File(self.tile_path, 'r') as f:
             data, _ = self._read(f['particles'], self._local_cell(region_id))
         keep = self._within_padding(data['pos'], region_id)
-        mass = (self.particle_mass if self.particle_mass is not None 
+        mass = (self.particle_mass if self.particle_mass is not None
                 else data['mass'][keep])
         return ParticleSet(data['pos'][keep], data['vel'][keep],
                            data['ID'][keep], mass)
