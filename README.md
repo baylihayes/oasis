@@ -3,6 +3,8 @@
 
 When using this code please cite Salazar et. al. (2025) ([arXiv:XXXX.XXXX]()).
 
+<span style="font-variant:small-caps;">Oasis</span> was created by Edgar Salazar ([edgarmsalazar/oasis](https://github.com/edgarmsalazar/oasis)) and is maintained by Bayli Hayes.
+
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Usage](#usage)
@@ -30,7 +32,7 @@ Reading compressed HDF5 snapshots (e.g. Quijote) may also need [`hdf5plugin`](ht
 ## Installation
 Build from source
 ```sh
-$ git clone https://github.com/edgarmsalazar/oasis.git
+$ git clone https://github.com/baylihayes/oasis.git
 $ cd oasis
 $ python -m pip install .
 ```
