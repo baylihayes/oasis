@@ -511,9 +511,8 @@ def build_tile(bucket_path: str, tile_path: str, tile_id: int, spec: TileSpec,
                   for a in range(0, n_rows, rows_per_block)]
 
         # Pass 1: rows per cell. Each block's cell IDs are kept for pass 2, in
-        # the smallest integer type that holds them (a stable sort of int16 is
-        # a radix sort, much faster than for int64; the order is the same).
-        cell_dtype = np.int16 if m3 <= np.iinfo(np.int16).max else np.int32
+        # the smallest integer type that holds them (see _cell_dtype).
+        cell_dtype = _cell_dtype(spec)
         counts = np.zeros(m3, dtype = np.int64)
         cells = []
         for b in blocks:
@@ -559,7 +558,8 @@ def build_tiles(make_particle_chunks: ChunkFactory, make_seed_chunks: ChunkFacto
     tiles themselves) exist only for the tiles being built. Refuses to run if any
     of this call's tile or bucket files already exist, unless overwrite = True, in 
     which case only those files are deleted first. Tiles of other calls in the same
-    out_dir are left alone.
+    out_dir are left alone. With one tile (tiles_per_side = 1), the rows are
+    written straight into the tile, without bucket files; the tile is the same.
 
     Parameters
     ----------
@@ -578,7 +578,7 @@ def build_tiles(make_particle_chunks: ChunkFactory, make_seed_chunks: ChunkFacto
         Constant particle mass, stored in the tile metadata. If None, particle
         chunks must contain a per-particle 'mass' column.
     keep_buckets : bool, default=False
-        Keep the intermediate bucket files (for debugging).
+        Keep the intermediate bucket files (for debugging). One tile has none.
     overwrite : bool, default=False
         Delete this call's existing tile/bucket files in out_dir first.
     tile_ids : iterable of int, optional
@@ -586,7 +586,8 @@ def build_tiles(make_particle_chunks: ChunkFactory, make_seed_chunks: ChunkFacto
     n_workers : int, default=1
         Worker processes. Chunks of ChunkTasks factories are read and assigned
         to tiles in parallel (written in order), and tiles are sorted into
-        cells in parallel. The tile files are identical for any n_workers.
+        cells in parallel (with one tile, each chunk is sorted into cells by
+        its worker). The tile files are identical for any n_workers.
 
     Raises
     ------
@@ -618,15 +619,123 @@ def build_tiles(make_particle_chunks: ChunkFactory, make_seed_chunks: ChunkFacto
             os.remove(path)
 
 
+    attrs = {} if particle_mass is None else {'particle_mass': particle_mass}
+    if spec.n_tiles == 1:
+        # One tile: every row belongs to it, so the rows are written straight
+        # into the tile, without bucket files (same tile file).
+        tile_path = os.path.join(out_dir, 'tile_0.hdf5')
+        _write_single_tile(make_particle_chunks, tile_path, spec, 'particles',
+                           attrs, n_workers)
+        _write_single_tile(make_seed_chunks, tile_path, spec, 'seeds', attrs,
+                           n_workers)
+        return
+
     bucket_into_tiles(make_particle_chunks, out_dir, spec, 'particles', tile_ids,
                       n_workers=n_workers)
     bucket_into_tiles(make_seed_chunks, out_dir, spec, 'seeds', tile_ids,
                       n_workers=n_workers)
-    attrs = {} if particle_mass is None else {'particle_mass': particle_mass}
     # Each tile is sorted into its own file, so tiles can be sorted in parallel.
     jobs = [(out_dir, t, spec, attrs, keep_buckets) for t in tile_ids]
     for _ in _in_order(_sort_tile_task, jobs, min(n_workers, len(jobs))):
         pass
+
+
+def _cell_dtype(spec: TileSpec):
+    """Smallest integer type holding the cell IDs of a tile (a stable sort of
+    int16 is a radix sort, much faster than for int64; the order is the same)."""
+    return np.int16 if spec.cells_per_side**3 <= np.iinfo(np.int16).max else np.int32
+
+
+def _single_tile_cells(chunk: dict, spec: TileSpec):
+    """One chunk of a one-tile box: its columns as stored in the tile and the
+    cell ID of each row. With one tile, every row is in its core, in chunk
+    order (as assign_to_tiles returns for tiles_per_side = 1)."""
+    columns = {k: np.asarray(v) for k, v in chunk.items()}
+    columns['pos'] = wrap_positions(chunk['pos'], spec.boxsize)
+    if 'vel' in columns:
+        columns['vel'] = np.asarray(columns['vel'], dtype=np.float32)
+    columns['in_core'] = np.ones(len(columns['pos']), dtype=bool)
+    cell = local_cell_ids(columns['pos'], 0, spec).astype(_cell_dtype(spec))
+    return columns, cell
+
+
+def _single_tile_count_task(args):
+    """Pass 1 for one chunk of a one-tile box: rows per cell and the chunk's columns."""
+    load, task, spec = args
+    chunk = load(task) if load is not None else task
+    pos = wrap_positions(chunk['pos'], spec.boxsize)
+    cell = local_cell_ids(pos, 0, spec).astype(_cell_dtype(spec))
+    return np.bincount(cell, minlength=spec.cells_per_side**3), _chunk_fields(chunk)
+
+
+def _single_tile_rows_task(args):
+    """Pass 2 for one chunk of a one-tile box: its rows sorted by cell (stable,
+    so rows keep their input order within a cell) and rows per cell."""
+    load, task, spec = args
+    columns, cell = _single_tile_cells(load(task) if load is not None else task, spec)
+    order = np.argsort(cell, kind='stable')
+    # np.take reorders rows faster than fancy indexing (same result).
+    columns = {k: np.take(v, order, axis=0) for k, v in columns.items()}
+    return columns, np.bincount(cell, minlength=spec.cells_per_side**3)
+
+
+def _write_single_tile(make_chunks: ChunkFactory, tile_path: str, spec: TileSpec,
+                       kind: str, attrs: dict, n_workers: int = 1) -> None:
+    """
+    Writes group 'kind' of the tile file of a one-tile box straight from the
+    input chunks, without bucket files. Pass 1 counts the rows per cell; pass 2
+    writes each chunk's rows, sorted by cell, after the rows of earlier chunks
+    in the same cell. The file is identical to bucket_into_tiles + build_tile.
+    """
+    m3 = spec.cells_per_side**3
+    parallel = n_workers > 1 and isinstance(make_chunks, ChunkTasks)
+    def run(task_fn):
+        if parallel:
+            return _in_order(task_fn, [(make_chunks.load, t, spec) for t in make_chunks.tasks],
+                             n_workers)
+        return (task_fn((None, chunk, spec)) for chunk in make_chunks())
+
+    counts = np.zeros(m3, dtype=np.int64)               # pass 1: rows per cell
+    fields = None
+    for chunk_counts, chunk_fields in run(_single_tile_count_task):
+        counts += chunk_counts
+        if fields is None:
+            fields = chunk_fields
+    if fields is None:
+        raise ValueError(f"No input chunks for '{kind}': make_chunks() yielded nothing. "
+                         "Check input path.")
+    fields['in_core'] = (np.dtype(bool), ())
+    offsets = np.concatenate(([0], np.cumsum(counts)))
+
+    os.makedirs(os.path.dirname(tile_path) or '.', exist_ok=True)
+    with h5py.File(tile_path, 'a') as dst:
+        if kind in dst:
+            raise FileExistsError(f"{tile_path} already contains a '{kind}' group.")
+        # Same metadata, datasets and order of writes as build_tile, so the
+        # file is identical (datasets in name order, like a bucket file's keys).
+        meta = dst.require_group('tile_metadata')
+        meta.attrs.update(dict(
+            global_boxsize=spec.boxsize, tiles_per_side = spec.tiles_per_side,
+            tile_id = 0, tile_index = spec.tile_index(0),
+            core_bounds = spec.core_bounds(0), buffer_width = spec.buffer_width,
+            inner_cell_size = spec.inner_cell_size, cells_per_side = spec.cells_per_side,
+            ring = spec.ring, **(attrs or {})
+        ))
+        grp = dst.create_group(kind)
+        out = {k: grp.create_dataset(k, shape=(counts.sum(),) + tail, dtype=dt)
+               for k, (dt, tail) in sorted(fields.items())}
+        grp.create_dataset('cell_offset', data=offsets)
+
+        cursor = offsets[:-1].copy()
+        for columns, chunk_counts in run(_single_tile_rows_task):  # pass 2
+            starts = np.concatenate(([0], np.cumsum(chunk_counts)))
+            for c in np.flatnonzero(chunk_counts):
+                lo, hi = starts[c], starts[c + 1]
+                for k in out:
+                    out[k][cursor[c]:cursor[c] + hi - lo] = columns[k][lo:hi]
+                cursor[c] += hi - lo
+        if not np.array_equal(cursor, offsets[1:]):
+            raise RuntimeError("input changed between the two passes.")
 
 
 def _sort_tile_task(args):

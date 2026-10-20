@@ -475,3 +475,36 @@ def test_single_tile_assignment_has_no_ribbon_copies():
     rows, tiles, in_core = assign_to_tiles(pos, spec)
     np.testing.assert_array_equal(rows, np.arange(len(pos)))
     assert np.all(tiles == 0) and in_core.all()
+
+
+def _bucket_build_single_tile(parts, seeds, out_dir, spec, attrs):
+    """The one-tile build through bucket files (the multi-tile path)."""
+    from oasis.tiles import _sort_tile_task, bucket_into_tiles
+    bucket_into_tiles(parts, out_dir, spec, 'particles', [0])
+    bucket_into_tiles(seeds, out_dir, spec, 'seeds', [0])
+    _sort_tile_task((out_dir, 0, spec, attrs, False))
+
+
+@pytest.mark.parametrize("cell, n_workers", [(L / 4, 1), (L / 10, 3), (L / 40, 1)])
+def test_single_tile_direct_write_identical_to_buckets(tmp_path, cell, n_workers):
+    """With one tile, build_tiles writes the rows straight into the tile; the
+    file is byte-identical to the one built through bucket files (L / 40 gives
+    64000 cells, so int32 cell IDs). Positions outside the box are wrapped."""
+    from oasis.tiles import ChunkTasks
+    spec = TileSpec(boxsize=L, tiles_per_side=1, buffer_width=0.0, inner_cell_size=cell)
+    tasks = _spatial_inputs(tmp_path)
+    for kind in ('parts', 'seeds'):                 # some rows outside [0, L)
+        path = tasks[kind][0][0]
+        with np.load(path) as d:
+            arrays = {k: d[k] for k in d.files}
+        arrays['pos'][::7] -= L / 3
+        np.savez(path, **arrays)
+    parts = ChunkTasks(_load_npz_slice, tasks['parts'])
+    seeds = ChunkTasks(_load_npz_slice, tasks['seeds'])
+    build_tiles(parts, seeds, str(tmp_path / 'direct'), spec, particle_mass=1.0,
+                n_workers=n_workers)
+    _bucket_build_single_tile(parts, seeds, str(tmp_path / 'buckets'), spec,
+                              {'particle_mass': 1.0})
+    assert sorted(p.name for p in (tmp_path / 'direct').iterdir()) == ['tile_0.hdf5']
+    assert ((tmp_path / 'direct' / 'tile_0.hdf5').read_bytes()
+            == (tmp_path / 'buckets' / 'tile_0.hdf5').read_bytes())
