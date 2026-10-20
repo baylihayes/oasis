@@ -294,16 +294,22 @@ def split_simulation_into_mini_boxes(
     uid : numpy.ndarray
         Unique identifiers for each object with shape (n,). Examples include 
         particle IDs (PID) or halo IDs (HID).
-    save_path : str
-        Target directory path where mini-box files will be saved. A subdirectory
-        will be created automatically at /save_path/mini_boxes_nside_<xx>/
+    save_dir : str
+        Target folder where mini-box files are written to,
+        /save_path/mini_boxes_nside_<xx>/, ending in '/'. It must exist
+        (process_simulation_data creates it).
     boxsize : float
         Size of the cubic simulation box. Must be a positive.
     minisize : float
         Target size of each mini-box. Must be positive and ≤ boxsize.
-    name : str, optional
-        Additional identifier to create a group within each HDF5 file.
-        If None, datasets are stored at the root level. Default is None.
+    particle_type : str
+        Group name for each mini-box file, e.g. 'dm' for particles and 'seed'
+        for seeds.
+    mass : float or numpy.ndarray
+        Mass of the objects: a scalar stored once (the particle mass; required
+        for 'dm'), or an array of shape (n,) with one value per object.
+    mass_label : str
+        Name of the mass dataset, e.g. 'mass' or 'M200b'.
     props : tuple of (list, list, list), optional
         Additional particle properties to include. Must contain exactly 3 lists:
         - List of numpy arrays with additional object data. For example M200, 
@@ -313,6 +319,9 @@ def split_simulation_into_mini_boxes(
         - List of numpy dtypes for each array
         All lists must have the same number of elements and all arrays must have
         shape (n, ...). Default is None.
+    n_threads : int, optional
+        Number of threads to use for parallel operations. Default: half the CPU
+        cores, at most the number of chunks.
 
     Returns
     -------

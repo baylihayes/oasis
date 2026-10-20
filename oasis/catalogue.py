@@ -815,6 +815,10 @@ class MiniBoxClassifier:
             particle in within_r200b that passes the velocity cut.
         v_ball_sq : float
             Squared velocity radius of the ball.
+        host_tree : cKDTree, optional
+            KD-Tree of the host's particles (within_r200b), built once per host.
+            If None, the tree of all loaded particles is queried and the result is
+            restricted to within_r200b (same result, slower).
 
         Returns
         -------
@@ -2179,8 +2183,9 @@ def process_tile(
 ) -> dict:
     """Process every core cell of one tile; safe to rerun after a failure.
     
-    Writes the cell catalogues to run_<run_name>/tiles_done/tile_<id>.json
-    with the run settings, the tile's cells and its timings. A tile with a 
+    Writes the cell catalogues to run_<run_name>/mini_box_catalogues/, and a
+    marker with the run settings, the tile's cells and its timings 
+    to run_<run_name>/tiles_done/tile_<id>.json. A tile with a 
     marker is skipped (unless redo=True), so a run can be restarted and only 
     unfinished tiles are processed. Leftover cell files of the tiles from an
     interrupted attempt are deleted first, so they cannot reach the merge.
@@ -2198,6 +2203,11 @@ def process_tile(
     ValueError
         If the tile was built for another boxsize, or it was already processed
         with different settings (padding, calibration file, tiling, ...).
+    
+    Notes
+    -----
+    Never process the same tile from two jobs at once; there is no lock. They 
+    will overwrite one another. 
     """
     run_dir = load_path + f'run_{run_name}/'
     done_dir = run_dir + 'tiles_done/'

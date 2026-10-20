@@ -40,7 +40,7 @@ class SeedSet:
 class ParticleSet:
     """
     Particles around one region, in global coordinates. Velocities are as 
-    stored in the simulation (v_sim = v_part / sqrt(a)). The classifier converts
+    stored in the simulation (v_sim = v_phys / sqrt(a)). The classifier converts
     them to the appropriate units.
 
     """
