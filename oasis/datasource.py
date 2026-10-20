@@ -1,9 +1,18 @@
 """
 Data sources that supply seeds and particles to the OASIS classifier.
 
-The classifier only needs arrays for one region (a minibox plus padding).
-A data source hides where those arrays come from (minibox files or prebuilt
+The classifier only needs arrays for one region (a cubic cell plus padding).
+A data source hides where those arrays come from (mini-box files or prebuilt
 core + ribbon tiles), so the science stays the same.
+
+- BufferedTileDataSource: a core cell of a tile built by oasis.tiles.build_tiles
+  (the current workflow), read with its neighboring cells.
+- LegacyMiniBoxDataSource: a mini-box file written by 
+  oasis.minibox.process_simulation_data (the workflow of earlier versions),
+  read with its 26 neighboring mini-boxes.
+
+Both return the same SeedSet and ParticleSet for that same region, so one
+tile per side replicates the mini-box workflow catalog exactly.
 """
 
 from abc import ABC, abstractmethod
@@ -21,7 +30,6 @@ from oasis.coordinates import _periodic_displacement
 class SeedSet:
     """
     Seeds around one region in global coordinates.
-    
     """
     pos: np.ndarray     #(n,3)
     vel: np.ndarray     #(n,3)
@@ -32,7 +40,9 @@ class SeedSet:
     in_core: np.ndarray #(n,) bool: True if this region owns the seed
 
     def __len__(self) -> int:
-        # return the length of the hid array
+        """
+        Number of seeds.
+        """
         return len(self.hid)
 
 
@@ -42,7 +52,6 @@ class ParticleSet:
     Particles around one region, in global coordinates. Velocities are as 
     stored in the simulation (v_sim = v_phys / sqrt(a)). The classifier converts
     them to the appropriate units.
-
     """
     pos: np.ndarray     #(n,3)
     vel: np.ndarray     #(n,3)
@@ -56,7 +65,6 @@ class SpatialDataSource(ABC):
 
     'boxsize' must always be the size of the whole periodic simulation, not
     the size of a region or tile.
-    
     """
     boxsize: float
 
@@ -81,20 +89,37 @@ class SpatialDataSource(ABC):
     def load_seeds(self, region_id: int) -> SeedSet:
         """
         Seeds in the region plus padding, with an ownership mask.
-
         """
 
     @abstractmethod
     def load_particles(self, region_id: int) -> ParticleSet:
         """
         Particles in the region plus padding.
-        
         """
 
 class LegacyMiniBoxDataSource(SpatialDataSource):
     """
-    Reads the previous minibox HDF5 files (mini_boxes_nside_<n>/<id>.hdf5).
-    
+    Reads the mini-box HDF5 files of earlier versions
+    (<load_path>/mini_boxes_nside_<n>/<id>.hdf5, see
+    oasis.minibox.process_simulation_data). Regions are the mini-boxes,
+    identified by their mini-box ID.
+
+    Parameters
+    ----------
+    load_path : str
+        Folder containing the mini_boxes_nside_<n>/, ending in '/'.
+    boxsize : float
+        The length of one side of the entire simulation.
+    minisize : float
+        The length of one side of the mini-boxes; n = ceil(boxsize / minisize) per side.
+    particle_type : str
+        The group name of objects e.g. 'dm' for particles. Seeds are always read
+        from the 'seed' group.
+    seed_prop_names : tuple of str, default=('M200b', 'R200b', 'Rs')
+        Mass, radius and scale radius dataset names in the 'seed' group.
+    padding : float, default=5.0
+        The distance around each mini-box from which particles and 
+        seeds will be loaded from neighboring mini-boxes.
     """
     def __init__(self, load_path, boxsize, minisize, particle_type,
                  seed_prop_names = ('M200b', 'R200b', 'Rs'), padding=5.0):
@@ -110,7 +135,7 @@ class LegacyMiniBoxDataSource(SpatialDataSource):
         return list(range(self.cells_per_side**3))
 
     def region_ids_by_workload(self) -> list[int]:
-        # Most populated miniboxes first; unreadable files last.
+        # Most populated mini-boxes first; unreadable files last.
         n_regions = self.cells_per_side**3
         counts = np.zeros(n_regions, dtype = np.int64)
         for box_id in range(n_regions):
@@ -137,13 +162,14 @@ class LegacyMiniBoxDataSource(SpatialDataSource):
 
 class BufferedTileDataSource(SpatialDataSource):
     """
-    Serves the inner cells of one prebuilt core + ribbon tile (see oasis.tiles)
+    Serves the inner cells of one prebuilt core + ribbon tile (see oasis.tiles).
     
     Regions are the tile's CORE cells, identified by their GLOBAL cell ID (the
     same number a mini-box of size inner_cell_size would have), so region IDs
-    never clash between tiles. Each region is a cell plus 'padding', read from the cell and its neighbors with 
-    direct slices (rows are grouped by cell, see 'cell_offset'). Ribbon cells are
-    only ever read as neighbors, never processed as regions.
+    never clash between tiles. Each region is a cell plus 'padding', read from 
+    the cell and its neighbors with direct slices (rows are grouped by cell, 
+    see 'cell_offset'). Ribbon cells are only ever read as neighbors, never 
+    processed as regions.
 
     Parameters
     ----------
@@ -157,13 +183,15 @@ class BufferedTileDataSource(SpatialDataSource):
     seed_prop_names : tuple of str, default=('M200b', 'R200b', 'Rs')
         Mass, radius and scale radius dataset names in the 'seeds' group.
 
-    The particle mass is read from the tile metadata (as float32, like the
-    minibox files); if absent, a per-particle 'mass' dataset is used.
-
     Raises
     ------
     ValueError
         If padding is larger than the tile's buffer_width (tiles_per_side > 1).
+    
+    Notes
+    -----
+    The particle mass is read from the tile metadata (as float32, like the
+    mini-box files); if absent, a per-particle 'mass' dataset is used.
     """
 
     def __init__(self, tile_path, padding = 5.0,
@@ -181,7 +209,7 @@ class BufferedTileDataSource(SpatialDataSource):
             # One tile for the whole box: neighbours wrap around the tile.
             self.periodic = int(meta['tiles_per_side']) == 1
             core_min = np.asarray(meta['core_bounds'])[:,0]
-            # stored as float32 like the minibox files, so Morb = N*m is
+            # stored as float32 like the mini-box files, so Morb = N*m is
             # computed with the same precision as before
             self.particle_mass = (np.float32(meta['particle_mass'])
                                     if 'particle_mass' in meta else None)
@@ -195,7 +223,7 @@ class BufferedTileDataSource(SpatialDataSource):
         self.layers = int(np.ceil(padding / self.cell_size))
         # Global index of the tile's first core cell along each axis
         self._g0 = np.rint(core_min / self.cell_size).astype(np.int64)
-        # Global cell grid: the same numbering as miniboxes of size cell_size
+        # Global cell grid: the same numbering as mini-boxes of size cell_size
         self.n_global = int(round(self.boxsize / self.cell_size))
         self._n_core = self.m - 2 * self.ring
 
@@ -206,14 +234,14 @@ class BufferedTileDataSource(SpatialDataSource):
 
     def region_center(self, region_id):
         """Center of a core cell in global coordinates, computed with the same 
-        formula as the minibox loader: (global cell index + 0.5) * size."""
+        formula as the mini-box loader: (global cell index + 0.5) * size."""
         n = self.n_global
         g = np.array([region_id % n, (region_id // n) % n, region_id // n**2])
         return (g + 0.5) * self.cell_size
 
     def region_ids(self):
-        """Global cell IDs of the tile's core cells, numbered like miniboxes of
-        size inner_cell_size, so region ID never clash between tiles."""
+        """Global cell IDs of the tile's core cells, numbered like mini-boxes of
+        size inner_cell_size, so region IDs never clash between tiles."""
         n, core = self.n_global, range(self._n_core)
         gx, gy, gz = self._g0
         return [(gx + i) + (gy + j) * n + (gz + k) * n**2 for k in core for j in core for i in core]
@@ -237,7 +265,7 @@ class BufferedTileDataSource(SpatialDataSource):
         """Rows of 'cell' and its neighbors (self.layers deep), and a mask of 
         the rows that belong to 'cell' itself."""
         i, j, k = self._ijk(cell)
-        L, m = self.layers, self.m
+        m = self.m
         offsets = group['cell_offset'][()]
         names = [n for n in group.keys() if n != 'cell_offset']
         pieces = {n: [] for n in names}
@@ -280,7 +308,7 @@ class BufferedTileDataSource(SpatialDataSource):
         return [tuple(r) for r in runs]
 
     def _within_padding(self, pos, region_id):
-        """Same cut as the minibox loader: |x - center| <= size / 2 + padding"""
+        """Same cut as the mini-box loader: |x - center| <= size / 2 + padding"""
         rel = _periodic_displacement(pos, self.region_center(region_id), self.boxsize)
         return np.all(np.abs(rel) <= 0.5 * self.cell_size + self.padding, axis = 1)
 
