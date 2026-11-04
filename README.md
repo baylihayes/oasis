@@ -18,29 +18,33 @@ When using this code please cite Salazar et. al. (2025) ([arXiv:XXXX.XXXX]()).
     - [Members catalogue](#halo-members-catalogue)
 
 ## Requirements
-Create a conda environment. An `environment.yml` file is supplied as an example but feel free to use your own. It needs Python 3.10 or later with `numpy`, `scipy`, `pandas`, `h5py`, `tqdm`, and `matplotlib`; `pip` installs them with <span style="font-variant:small-caps;">Oasis</span> if they are missing.
-```sh
-$ conda env create -f environment.yml
-$ conda activate oasis
-```
-Alternatively
-```sh
-$ conda create --name <env name> python=3.10 numpy scipy pandas h5py tqdm matplotlib
-```
-Reading compressed HDF5 snapshots (e.g. Quijote) may also need [`hdf5plugin`](https://github.com/silx-kit/hdf5plugin), imported in your own reading code.
+Python 3.10 or later with `numpy`, `scipy`, `pandas`, `h5py`, `tqdm`, and `matplotlib`. They are installed with <span style="font-variant:small-caps;">Oasis</span> by `pip` if they are missing. Reading compressed HDF5 snapshots (e.g. Quijote) may also need [`hdf5plugin`](https://github.com/silx-kit/hdf5plugin), imported in your own reading code.
 
 ## Installation
-Build from source
-```sh
-$ git clone https://github.com/baylihayes/oasis.git
-$ cd oasis
-$ python -m pip install .
-```
-To run the tests (about 3 minutes):
-```sh
-$ python -m pip install ".[test]"
-$ python -m pytest test
-```
+1. Clone the repository:
+    ```sh
+    $ git clone https://github.com/baylihayes/oasis.git
+    $ cd oasis
+    ```
+2. Create and activate a conda environment. The repository includes an `environment.yml` with everything needed:
+    ```sh
+    $ conda env create -f environment.yml
+    $ conda activate oasis
+    ```
+    or make your own, e.g.
+    ```sh
+    $ conda create --name <env name> python=3.10 numpy scipy pandas h5py tqdm matplotlib
+    $ conda activate <env name>
+    ```
+3. Install <span style="font-variant:small-caps;">Oasis</span> into the active environment:
+    ```sh
+    $ python -m pip install .
+    ```
+4. Optionally, run the tests (about 3 minutes):
+    ```sh
+    $ python -m pip install ".[test]"
+    $ python -m pytest test
+    ```
 
 ## Usage
 A [template](template.py) file is provided as an example of how to use the code. It consists of three basic steps: building tiles from the simulation data, calibrating, and finding haloes.
