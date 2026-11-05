@@ -18,7 +18,7 @@ When using this code please cite Salazar et. al. (2025) ([arXiv:XXXX.XXXX]()).
     - [Members catalogue](#halo-members-catalogue)
 
 ## Requirements
-Python 3.10 or later with `numpy`, `scipy`, `pandas`, `h5py`, `tqdm`, and `matplotlib`. They are installed with <span style="font-variant:small-caps;">Oasis</span> by `pip` if they are missing. Reading compressed HDF5 snapshots (e.g. Quijote) may also need [`hdf5plugin`](https://github.com/silx-kit/hdf5plugin), imported in your own reading code.
+Python 3.10 or later with `numpy`, `scipy`, `pandas`, `h5py`, `tqdm`, `matplotlib` and `hdf5plugin`. They are installed with <span style="font-variant:small-caps;">Oasis</span> by `pip` if they are missing. Reading compressed HDF5 snapshots (e.g. Quijote) needs `import hdf5plugin` in your reading code, before the files are opened.
 
 ## Installation
 1. Clone the repository:
@@ -33,7 +33,7 @@ Python 3.10 or later with `numpy`, `scipy`, `pandas`, `h5py`, `tqdm`, and `matpl
     ```
     or make your own, e.g.
     ```sh
-    $ conda create --name <env name> python=3.10 numpy scipy pandas h5py tqdm matplotlib
+    $ conda create --name <env name> python=3.10 numpy scipy pandas h5py tqdm matplotlib hdf5plugin
     $ conda activate <env name>
     ```
 3. Install <span style="font-variant:small-caps;">Oasis</span> into the active environment:

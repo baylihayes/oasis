@@ -4,3 +4,4 @@ scipy
 h5py
 tqdm
 matplotlib
+hdf5plugin
