@@ -507,7 +507,7 @@ class MiniBoxClassifier:
             Redshift of the simulation.
         r200 : float
             Overdensity radius of the halo (R200), defining the boundary where
-            the mean enclosed density is 200 times the critical density.
+            the mean enclosed density is 200 times the mean density.
         m200 : float
             Overdensity mass of the halo (M200), the mass enclosed within R200.
         class_pars : list, tuple, or numpy.ndarray
