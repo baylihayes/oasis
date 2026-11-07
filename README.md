@@ -1,9 +1,9 @@
 ![](res/oasis.jpg "title")
 # Orbiting Mass Assignment Scheme
 
-When using this code please cite Salazar et. al. (2025) ([arXiv:XXXX.XXXX]()).
+When using this code please cite Hayes et al. (2026) ([arXiv:XXXX.XXXX]()).
 
-<span style="font-variant:small-caps;">Oasis</span> was created by Edgar Salazar ([edgarmsalazar/oasis](https://github.com/edgarmsalazar/oasis)) and is maintained by Bayli Hayes.
+<span style="font-variant:small-caps;">Oasis</span> was created by Edgar Salazar ([edgarmsalazar/oasis](https://github.com/edgarmsalazar/oasis)) and is maintained by Bayli Hayes ([baylihayes/oasis](https://github.com/baylihayes/oasis)).
 
 - [Requirements](#requirements)
 - [Installation](#installation)
@@ -49,6 +49,8 @@ Python 3.10 or later with `numpy`, `scipy`, `pandas`, `h5py`, `tqdm`, `matplotli
 ## Usage
 A [template](template.py) file is provided as an example of how to use the code. It consists of three basic steps: building tiles from the simulation data, calibrating, and finding haloes.
 
+For complete worked examples (a small box with one tile and a large box with many), see [how_to/README.md](how_to/README.md).
+
 ### User parameters
 The choice of units is not strict to the ones shown below. However, it must be consistent across all quantities with the same physical dimensions. For example, if the units for the `boxsize` are in $h^{-1}{\rm Mpc}$, then all distances, positions and radii must also be provided in $h^{-1}{\rm Mpc}$. All lengths are comoving: positions, $R_{\rm 200b}$, $R_s$, `boxsize`, `padding` and `r_max` in comoving $h^{-1}{\rm Mpc}$ (in this example), and `mass_density` is the comoving mean matter density, i.e. its $z = 0$ value at any redshift. Note that <span style="font-variant:small-caps;">Rockstar</span> gives $R_s$ and $R_{\rm vir}$ in comoving $h^{-1}{\rm kpc}$: divide them by 1000.
 
@@ -71,7 +73,7 @@ With `tiles_per_side=1` and `buffer_width=0`, the catalogue is identical to the 
 
 where $R_{s}$ is the NFW scale radius, and $M_{\rm 200b}$ is [<span style="font-variant:small-caps;">Rockstar</span>](https://ui.adsabs.harvard.edu/abs/2013ApJ...762..109B/abstract) mass definition.
 
-> Velocities are assumed to be physical velocities scaled by the scale factor $a$, like $v_{\rm phys}/\sqrt{a}$. The kinetic energy $T\sim a^{-2}$ so that $\ln\left(a^2v^2/v_{\rm 200m}\right) - r/R_{\rm 200m}$ space is within a fixed range. Please make sure the input velocities are in this convention.
+> **Velocities.** Particle velocities are expected in the GADGET convention, $v_{\rm phys}/\sqrt{a}$; <span style="font-variant:small-caps;">Oasis</span> multiplies them by $\sqrt{a}$. Seed (halo) velocities are expected to be physical peculiar velocities in km/s, as <span style="font-variant:small-caps;">Rockstar</span> gives them. Positions and radii stay comoving. Only $V_{\rm 200b}^2 = GM_{\rm 200b}/R_{\rm 200b}$ is converted to physical units internally, with $R_{\rm phys} = aR_{\rm 200b}$, so that particles are classified in the plane of $\ln(v^2/V_{\rm 200b}^2)$ against $r/R_{\rm 200b}$ with physical velocities, and the same cut applies at any redshift.
 
 The data are passed to `build_tiles` one file at a time, so the whole box never has to be in memory. You write one function that reads a single particle file and one that reads a single seed file, each returning a dictionary of arrays, and `ChunkTasks` applies them to your lists of files:
 ```python
@@ -99,11 +101,11 @@ With `n_workers > 1`, that many files are read in parallel. The readers must be 
 The tiles need about the same disk space as the input data (plus the ribbons), and temporary files of the same size while they are built.
 
 ### Step 2: Calibration
-Before finding haloes, <span style="font-variant:small-caps;">Oasis</span> needs to be calibrated. That is, it needs to find the cut line in $\ln\ a^2v^2-r$ space that classifies particles into orbiting and infalling. This is only done once per simulation box, so subsequent runs on the same box use the same calibration.
+Before finding haloes, <span style="font-variant:small-caps;">Oasis</span> needs to be calibrated. That is, it needs to find the cut lines in the plane of $\ln(v^2/V_{\rm 200b}^2)$ against $r/R_{\rm 200b}$ that classify particles into orbiting and infalling. ($\rm 200m$ and $\rm 200b$ both mean 200 times the mean density; the former is used to calculate the cuts, while the latter is used to actually perform the cuts.) This is only done once per simulation box, so subsequent runs on the same box use the same calibration.
 
 There are two options for calibrating the algorithm.
 
-1. Assume cosmological dependence. The slope of both cut lines depends on $\Omega_m(z)$, the matter density parameter at the snapshot's redshift, as $$m = -1.903 + 0.4348\,\ln\left(\Omega_m(z)/0.5\right),$$ a fit to the self-calibrated slopes of the [Quijote](https://quijote-simulations.readthedocs.io/en/latest/) latin hypercube sample. The values of the lines at $r/R_{\rm 200m}=0.5$ are fixed to the values found in Salazar et. al. (2025) ([arXiv:XXXX.XXXX]()).
+1. Assume cosmological dependence. The slope of both cut lines depends on $\Omega_m(z)$, the matter density parameter at the snapshot's redshift, as $$m = -1.903 + 0.4348\,\ln\left(\Omega_m(z)/0.5\right),$$ a fit to the self-calibrated slopes of the [Quijote](https://quijote-simulations.readthedocs.io/en/latest/) latin hypercube sample. The values of the lines at $r/R_{\rm 200m}=0.5$ are fixed to the values found in Hayes et al. (2026) ([arXiv:XXXX.XXXX]()).
 
     > **RESULTS MAY VARY**. While this choice reduces noise in mass function measurements across different cosmologies, it is recommended to do a sanity check against calibration directly on the data.
 
@@ -179,7 +181,7 @@ run_tiled_orbiting_mass_assignment(
 )
 ```
 
-For large boxes, `process_tile` processes one tile per call (finished tiles are skipped when a run is restarted) and `merge_tiled_run` merges the finished tiles into one catalogue, checks it and writes a `manifest.json` with the settings and code version.
+For large boxes, `process_tile` processes one tile per call (finished tiles are skipped when a run is restarted) and `merge_tiled_run` merges the finished tiles into one catalogue, checks it and writes a `manifest.json` with the settings and code version (see [Running a large box as separate jobs](how_to/README.md#running-a-large-box-as-separate-jobs)).
 
 ### Existing mini-box data
 The mini-box workflow of earlier versions (`oasis.minibox.process_simulation_data` and `oasis.catalogue.run_orbiting_mass_assignment`) is still available, for existing mini-box data and for reproducing the original <span style="font-variant:small-caps;">Oasis</span> exactly. It gives the same catalogue as one tile per side, but holds the whole box in memory and writes one file per mini-box.
@@ -216,10 +218,10 @@ The `catalogue.hdf5` file contains the following columns:
 - `Morb`: orbiting mass, $M_{\rm orb}=m_p N_{\rm orb}$, where $m_p$ is the particle mass.
 - `NSUBS`: number of orbiting seeds.
 - `PID`: parent dynamical halo ID. If the seed is orbiting another halo, then `PID` is the `Halo_ID` of the parent halo, `PID=-1` otherwise.
-- `LIDX`, `RIDX`: row index in the `members.hdf5` file corresponding to the first ('left') and last ('right') member particle of the halo.
-- `SLIDX`, `SRIDX`: row index in the `members.hdf5` file corresponding to the first ('left') and last ('right') member seed of the halo. If the halo has no orbiting seeds then both `SLIDX=-1` and `SRIDX=-1`.
+- `LIDX`, `RIDX`: row index in the `members.hdf5` file corresponding to the first ('left') and one past the last ('right') member particle of the halo.
+- `SLIDX`, `SRIDX`: row index in the `members.hdf5` file corresponding to the first ('left') and one past the last ('right') member seed of the halo. If the halo has no orbiting seeds then both `SLIDX=-1` and `SRIDX=-1`.
 
 ### Halo Members Catalogue
 The `members.hdf5` file contains only two datasets:
-- `Halo_ID`: halo ID corresponding to the user input data `hid`.
-- `PID`: particle ID corresponding to the user input data `pid`.
+- `Halo_ID`: IDs of the orbiting member seeds (substructure), sliced by `SLIDX:SRIDX`.
+- `PID`: IDs of the orbiting member particles, sliced by `LIDX:RIDX` (not the parent ID `PID` of `catalogue.hdf5`).
