@@ -31,7 +31,7 @@ The required data from the particle snapshot files are the following:
 - $\vec{x}$
 - $\vec{v}$
 
-Like the halo seed catalogue, $\vec{x}$ is expected to be in comoving units of the same kind as the halo seed catalogue. $\vec{v}$, however, is expected to be in GADGET convention, $\vec{v}_{sim}$ = $\vec{v}_{phys} / \sqrt a$. <span style="font-variant:small-caps;">Oasis</span> handles this internally, so no need to convert to physical units prior. 
+Like the halo seed catalogue, $\vec{x}$ is expected to be in comoving units of the same kind as the halo seed catalogue. $\vec{v}$, however, is expected to be in GADGET convention, $\vec{v}_{\rm sim}$ = $\vec{v}_{\rm phys} / \sqrt{a}$. <span style="font-variant:small-caps;">Oasis</span> handles this internally, so no need to convert to physical units prior. 
 
 ## Reading in Data
 
