@@ -1037,7 +1037,7 @@ def _diagnostic_calibration_data_plot(
 
     for ax in axes:
         ax.set_xlabel(r'$r/R_{\rm 200m}$', fontsize=SIZE_LABELS)
-        ax.set_ylabel(r'$\ln(a^2v^2/v_{\rm 200m}^2)$', fontsize=SIZE_LABELS)
+        ax.set_ylabel(r'$\ln(v^2/v_{\rm 200m}^2)$', fontsize=SIZE_LABELS)
         ax.set_xlim(*limits[0])
         ax.set_ylim(*limits[1])
         ax.tick_params(axis="both", which="major", labelsize=SIZE_TICKS)
@@ -2294,7 +2294,7 @@ def _diagnostic_self_calibration_plot(
 
     for ax in axes:
         ax.set_xlabel(r'$r/R_{\rm 200m}$', fontsize=SIZE_LABELS)
-        ax.set_ylabel(r'$\ln(a^2v^2/v_{\rm 200m}^2)$', fontsize=SIZE_LABELS)
+        ax.set_ylabel(r'$\ln(v^2/v_{\rm 200m}^2)$', fontsize=SIZE_LABELS)
         ax.set_xlim(*limits[0])
         ax.set_ylim(*limits[1])
         ax.tick_params(axis="both", which="major", labelsize=SIZE_TICKS)
