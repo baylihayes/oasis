@@ -1,3 +1,6 @@
+"""Coordinate helpers: periodic relative positions (minimum image convention)
+and the decomposition of velocities into radial and tangential components."""
+
 import numpy
 
 from oasis.common import (_validate_coordinate_array,
@@ -48,7 +51,7 @@ def relative_coordinates(
         If `positions` does not have shape (N, 3) or (3,), `reference` does not
         have shape (3,), or `boxsize` is not a positive scalar.
     TypeError
-        If inputs cannot be converted to appropriate numpy arrays.
+        If inputs are not appropriate numpy arrays.
 
     Notes
     -----
@@ -65,7 +68,7 @@ def relative_coordinates(
     >>> rel_pos = relative_coordinates(positions, reference, 1.0)
     >>> print(rel_pos)
     [[-0.4 -0.3 -0.2]
-     [ 0.6  0.3  0.2]]
+     [-0.4  0.3  0.2]]
 
     Single position (1D input):
     >>> single_pos = numpy.array([0.1, 0.2, 0.3])
@@ -78,7 +81,7 @@ def relative_coordinates(
     >>> rel_pos_no_pbc = relative_coordinates(positions, reference, 1.0, periodic=False)
     >>> print(rel_pos_no_pbc)
     [[-0.4 -0.3 -0.2]
-     [ 0.4  0.3  0.2]]
+     [0.6  0.3  0.2]]
     """
     # Input validation and type conversion
     _validate_coordinate_array(positions, "positions")
@@ -116,7 +119,7 @@ def velocity_components(
     positions: numpy.ndarray,
     velocities: numpy.ndarray
 ) -> tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
-    """
+    r"""
     Compute radial and tangential velocity components from Cartesian coordinates.
 
     This function decomposes velocity vectors into radial (along the position
@@ -152,7 +155,7 @@ def velocity_components(
         If `positions` or `velocities` do not have shape (N, 3) or (3,),
         or if arrays have incompatible shapes.
     TypeError
-        If inputs cannot be converted to appropriate numpy arrays.
+        If inputs are not appropriate numpy arrays.
 
     Notes
     -----
@@ -172,8 +175,8 @@ def velocity_components(
     >>> vr, vt, v2 = velocity_components(positions, velocities)
     >>> print(f"Radial velocities: {vr}")
     >>> print(f"Tangential velocities: {vt}")
-    Radial velocities: [0.5 -0.5]
-    Tangential velocities: [0.5  0.5]
+    Radial velocities: [0.5 0.5]
+    Tangential velocities: [0.5 0.5]
 
     Single particle (1D input):
     >>> single_pos = numpy.array([1.0, 1.0, 0.0])
@@ -190,8 +193,8 @@ def velocity_components(
     >>> vr, vt, v2 = velocity_components(positions, velocities)
     >>> print(f"Radial velocities: {vr}")
     >>> print(f"Tangential velocities: {vt}")
-    Radial velocities: [ 0.5 -1.0]
-    Tangential velocities: [0.0 0.0]
+    Radial velocities: [ 0.5 -1. ]
+    Tangential velocities: [0. 0.]
     """
     # Input validation and type conversion
     _validate_coordinate_array(positions, "positions")

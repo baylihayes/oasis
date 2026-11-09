@@ -1,3 +1,20 @@
+"""Split a simulation into cubic mini-boxes and load them back.
+
+The box is split into ceil(boxsize / minisize)**3 mini-boxes. Each mini-box is
+one HDF5 file, save_path/mini_boxes_nside_<n>/<id>.hdf5, with one group per 
+particle type (e.g. 'dm' for particles, 'seed' for halo seeds from ROCKSTAR 
+halo catalogues) holding 'ID', 'pos', 'vel', the mass and any extra properties.
+
+Mini-box IDs are id = ix + iy*n + iz*n**2, where (ix, iy, iz) are the cell
+indicies along the x, y, z axes and n is the number of cells per side. 
+
+New runs should use the tiled workflow (oasis.tiles.build_tiles): one tile per
+side with buffer_width = 0 gives the same catalogue without writing mini-box
+files and without holding the whole box in memory. The functions here remain
+for existing mini-box data and for reproducing the original OASIS;
+minibox_chunks converts existing mini-box files to tiles.
+"""
+
 import os
 from multiprocessing.dummy import Pool as ThreadPool
 from pathlib import Path
@@ -19,6 +36,8 @@ __all__ = [
     'process_simulation_data',
     'load_particles',
     'load_seeds',
+    'minibox_chunks',
+    'minibox_particle_mass',
 ]
 
 
@@ -40,9 +59,9 @@ def get_mini_box_id(
         Position(s) in cartesian coordinates. Can be:
         - 1D array of shape (3,) for a single position
         - 2D array of shape (N, 3) for N positions
-        Each position should have [x, y, z] coordinates within [0, boxsize).
+        Each position should have [x, y, z] coordinates within [0, boxsize].
     boxsize : float
-        Size of the cubic simulation box. Must be a positive.
+        Size of the cubic simulation box. Must be positive.
     minisize : float  
         Size of each cubic mini-box. Must be positive and ≤ boxsize.
 
@@ -58,27 +77,30 @@ def get_mini_box_id(
     TypeError
         If position is not a numpy array or boxsize or minisize are not numeric.
     ValueError
-        If minisize > boxsize, or if any coordinate is outside [0, boxsize),
+        If minisize > boxsize, or if any coordinate is outside [0, boxsize],
         or if position array has wrong dimensions, or if boxsize or minisize ≤ 0.
+    RuntimeError
+        If a computed grid index is out of range (should not happen for a valid input).
 
     Notes
     -----
     - Positions exactly at the upper boundary (boxsize) are adjusted inward
       by a small tolerance to ensure they fall within valid mini-boxes.
     - The function modifies the input array in-place for memory efficiency.
-    - The function uses a 3D-to-1D mapping: ID = i + j*nx + k*nx*ny
-      where (i,j,k) are grid indices and nx, ny, nz are grid dimensions.
+    - The function uses a 3D-to-1D mapping: ID = ix + iy*n + iz*n**2, where 
+        (ix, iy, iz) are the cell indicies along the x, y, z axes and n is 
+        the number of cells per side (n = ceil(boxsize / minisize)).
 
     Examples
     --------
     >>> import numpy as numpy
     >>> pos = numpy.array([1.5, 2.5, 3.5])
     >>> get_mini_box_id(pos, boxsize=10.0, minisize=2.0)
-    32
+    30
 
     >>> positions = numpy.array([[1.5, 2.5, 3.5], [0.1, 0.1, 0.1]])
     >>> get_mini_box_id(positions, boxsize=10.0, minisize=2.0)
-    array([32,  0])
+    array([30,  0])
     """
     EDGE_TOL = 1e-8
 
@@ -148,10 +170,11 @@ def get_adjacent_mini_box_ids(
     Returns
     -------
     numpy.ndarray
-        Array of shape (27,) containing all adjacent mini-box IDs, including
-        the input ID. The first element is always the input mini_box_id, 
-        followed by the 26 neighboring IDs in no particular order.
-        Array dtype is numpy.int32.
+        Array of shape (27,), dtype int32, containing all adjacent mini-box IDs, 
+        including the input ID. The first element is always the input mini_box_id, 
+        followed by the 26 neighboring IDs in a fixed order (dz, dy, dx each looping
+        over -1, 0, 1). With fewer than 3 cells per side the same ID appears more than 
+        once. 
 
     Raises
     ------
@@ -169,23 +192,22 @@ def get_adjacent_mini_box_ids(
     -----
     - Uses periodic boundary conditions: mini-boxes at grid boundaries are
       considered adjacent to mini-boxes on the opposite boundary.
-    - The 3D grid uses the mapping: ID = k + jxnx + ixnx², where (i,j,k) are
-      grid coordinates and nx is the number of cells per side.
+    - The 3D grid uses the mapping: ID = ix + iy*n + iz*n**2 (see mini_box_id).
     - For a grid with n cells per side, total mini-boxes = n³.
-    - The function always returns exactly 27 IDs regardless of grid size.
 
     Examples
     --------
     >>> import numpy as np
     >>> # 2x2x2 grid (8 total mini-boxes)
-    >>> get_adjacent_mini_box_ids(0, boxsize=2.0, minisize=1.0)
-    array([0, 1, 2, 3, 4, 5, 6, 7, ...], dtype=int32)  # All boxes due to wrapping
+    >>> ids = get_adjacent_mini_box_ids(0, boxsize=2.0, minisize=1.0)
+    >>> sorted(set(ids.tolist()))           # every box is a neighbor
+    [0, 1, 2, 3, 4, 5, 6, 7]
 
     >>> # Larger grid - interior box
     >>> ids = get_adjacent_mini_box_ids(111, boxsize=10.0, minisize=1.0)  # 10x10x10 grid
     >>> len(ids)
     27
-    >>> ids[0]  # First element is always the input ID
+    >>> int(ids[0])  # First element is always the input ID
     111
     """
     # Input validation
@@ -272,16 +294,22 @@ def split_simulation_into_mini_boxes(
     uid : numpy.ndarray
         Unique identifiers for each object with shape (n,). Examples include 
         particle IDs (PID) or halo IDs (HID).
-    save_path : str
-        Target directory path where mini-box files will be saved. A subdirectory
-        will be created automatically at /save_path/mini_boxes_nside_<xx>/
+    save_dir : str
+        Target folder where mini-box files are written to,
+        /save_path/mini_boxes_nside_<xx>/, ending in '/'. It must exist
+        (process_simulation_data creates it).
     boxsize : float
         Size of the cubic simulation box. Must be a positive.
     minisize : float
         Target size of each mini-box. Must be positive and ≤ boxsize.
-    name : str, optional
-        Additional identifier to create a group within each HDF5 file.
-        If None, datasets are stored at the root level. Default is None.
+    particle_type : str
+        Group name for each mini-box file, e.g. 'dm' for particles and 'seed'
+        for seeds.
+    mass : float or numpy.ndarray
+        Mass of the objects: a scalar stored once (the particle mass; required
+        for 'dm'), or an array of shape (n,) with one value per object.
+    mass_label : str
+        Name of the mass dataset, e.g. 'mass' or 'M200b'.
     props : tuple of (list, list, list), optional
         Additional particle properties to include. Must contain exactly 3 lists:
         - List of numpy arrays with additional object data. For example M200, 
@@ -291,6 +319,9 @@ def split_simulation_into_mini_boxes(
         - List of numpy dtypes for each array
         All lists must have the same number of elements and all arrays must have
         shape (n, ...). Default is None.
+    n_threads : int, optional
+        Number of threads to use for parallel operations. Default: half the CPU
+        cores, at most the number of chunks.
 
     Returns
     -------
@@ -313,6 +344,8 @@ def split_simulation_into_mini_boxes(
     - Each mini-box is saved as '{mini_box_id}.hdf5'
     - Memory usage is optimized by processing particles in chunks
     - Progress bars show completion status for ID computation and file saving
+    - Positions are wrapped into [0, boxsize); positions that would round up
+      to boxsize when stored as float32 are stored as 0 (periodically the same)
 
     Examples
     --------
@@ -334,6 +367,13 @@ def split_simulation_into_mini_boxes(
 
     # Trim values outside boxsize due to floating point precision
     positions = numpy.mod(positions, boxsize)
+
+    # Positions are stored as float32. Values just below 'boxsize' can round up
+    # to exactly 'boxsize' (or above) in float32, which the periodic KD-trees
+    # reject. Such a position is periodically equivalent to 0, so store it as 0. 
+    on_edge = positions.astype(numpy.float32).astype(numpy.float64) >= boxsize
+    if numpy.any(on_edge):
+        positions[on_edge] = 0.0
 
     # Compute mini-box IDs for all objects in chunks with size of the average 
     # number of items per mini-box to improve computation speed and reduce 
@@ -466,6 +506,11 @@ def process_simulation_data(
     """
     Validate and process simulation particle data before saving.
 
+    Kept for existing workflows and for reproducing the original OASIS. New
+    runs should build tiles instead (oasis.tiles.build_tiles; tiles_per_side=1
+    and buffer_width=0 give the same catalogue), which streams the data and
+    never holds the whole box in memory.
+
     Parameters
     ----------
     save_path : str
@@ -578,7 +623,7 @@ def load_particles(
     load_path: Union[str, Path],
     particle_type: str,
     padding: float = 5.0,
-) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
+) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, Union[float, numpy.ndarray]]:
     """
     Load particles from a mini-box and its adjacent neighbors within padding distance.
 
@@ -601,10 +646,12 @@ def load_particles(
         Path to directory containing the mini-box HDF5 files. The directory
         should contain a subdirectory named 'mini_boxes_nside_<xx>/' where <xx>
         is the number of cells per side.
+    particle_type : str
+        Name of the particle group in the mini-box files (e.g. 'dm').
     padding : float, optional
         Maximum distance from mini-box edges to include particles. Particles 
         further than this distance from any edge of the target mini-box will be 
-        excluded. Must be non-negative. Default is 5.0.
+        excluded. Must be positive. Default is 5.0.
 
     Returns
     -------
@@ -617,6 +664,9 @@ def load_particles(
     particle_ids : numpy.ndarray
         Particle IDs with shape (n_particles,) containing unique identifiers
         corresponding to the returned positions and velocities.
+    masses : float or numpy.ndarray
+        Particle mass: a single value for constant-mass particles, otherwise
+        one value per returned particle.
 
     Raises
     ------
@@ -625,15 +675,17 @@ def load_particles(
         not numeric, or load_path is not a string or Path.
     ValueError
         If mini_box_id is negative or invalid for the grid, boxsize or minisize 
-        are non-positive, minisize > boxsize, or padding is negative.
+        are non-positive, minisize > boxsize, or padding is not positive.
     FileNotFoundError
-        If load_path doesn't exist or required mini-box files are missing.
+        If load_path or its 'mini_boxes_nside_<xx>/' folder does not exist.
     NotADirectoryError
         If load_path is not a directory.
     OSError
         If HDF5 files cannot be read or are corrupted.
-    RuntimeError
-        If loaded data is inconsistent or if no particles are found.
+    ValueError
+        If no file of the mini-box or its  neighbors contains particle_type,
+        or if they contain no rows at all. (If rows exist but none lie within
+        the padding, empty arrays are returned.)
 
     See Also
     --------
@@ -643,17 +695,21 @@ def load_particles(
     Notes
     -----
     - Uses periodic boundary conditions when calculating relative coordinates
-    - Loads from all 27 mini-boxes (target + 26 neighbors) to ensure complete
-      coverage within padding distance
-    - Memory usage scales with the number of particles in the 27 mini-boxes
+    - Reads the target mini-box and its 26  neighbors, each file once (fewer
+      files when the grid has fewer than 3 cells per side)
+    - Mini-boxes without a file (nothing in them) and files without
+      particle_type (e.g. seeds only) are skipped
+    - The padding mask is applied to each file as it is read, so memory scales
+      with the selected particles, not with all 27 mini-boxes
 
     Examples
     --------
-    >>> positions, velocities, ids = load_particles(
+    >>> positions, velocities, ids, masses = load_particles(
     ...     mini_box_id=42,
     ...     boxsize=100.0,
     ...     minisize=10.0,
     ...     load_path="/data/simulation/",
+    ...     particle_type="dm",
     ...     padding=2.0
     ... )
     >>> print(f"Loaded {len(positions)} particles")
@@ -662,7 +718,7 @@ def load_particles(
     _validate_inputs_load(mini_box_id, boxsize, minisize, load_path, padding)
 
     # Get the adjacent mini-box IDs. With fewer than 3 cells per side the same
-    # neighbour appears several times; load each mini-box only once.
+    #  neighbor appears several times; load each mini-box only once.
     mini_box_ids = _unique_in_order(get_adjacent_mini_box_ids(
         mini_box_id=mini_box_id,
         boxsize=boxsize,
@@ -681,28 +737,48 @@ def load_particles(
     # Create empty lists (containers) to save the data from file for each ID
     positions, velocities, ids, masses = ([] for _ in range(4))
     n_loaded = 0
+    n_with_type = 0
 
-    # Load all adjacent boxes
-    try:
-        for mini_box in mini_box_ids:
-            file_name = f'mini_boxes_nside_{cells_per_side}/{mini_box}.hdf5'
-            with h5py.File(load_path + file_name, 'r') as hdf:
-                pos_i = hdf[f'{particle_type}/pos'][()]
-                n_loaded += len(pos_i)
-                mask = numpy.all(numpy.abs(_periodic_displacement(
-                    pos_i, center, boxsize)) <= padded_distance, axis=1)
+    # The mini-box folder must exist (a missing folder means a wrong
+    # load_path or minisize, not an empty region).
+    box_dir = Path(load_path) / f'mini_boxes_nside_{cells_per_side}'
+    if not box_dir.is_dir():
+        raise FileNotFoundError(f"Minibox folder not found: {box_dir}")
 
-                positions.append(pos_i[mask])
-                velocities.append(hdf[f'{particle_type}/vel'][()][mask])
-                ids.append(hdf[f'{particle_type}/ID'][()][mask])
+    # Load all adjacent boxes. Mini-boxes with nothing in them have no file,
+    # and a file may hold seeds but no particles of this type; both are 
+    # skipped. Any other read error is raised.
+    for mini_box in mini_box_ids:
+        file_name = box_dir / f'{mini_box}.hdf5'
+        if not file_name.exists():
+            continue
+        with h5py.File(file_name, 'r') as hdf:
+            if particle_type not in hdf:
+                continue
+            n_with_type += 1
+            pos_i = hdf[f'{particle_type}/pos'][()]
+            n_loaded += len(pos_i)
+            mask = numpy.all(numpy.abs(_periodic_displacement(
+                pos_i, center, boxsize)) <= padded_distance, axis=1)
+
+            positions.append(pos_i[mask])
+            velocities.append(hdf[f'{particle_type}/vel'][()][mask])
+            ids.append(hdf[f'{particle_type}/ID'][()][mask])
                 
-                if hdf[f'{particle_type}/mass'].shape == ():
-                    masses = hdf[f'{particle_type}/mass'][()]
-                else:
-                    masses.append(hdf[f'{particle_type}/mass'][()][mask])
+            if hdf[f'{particle_type}/mass'].shape == ():
+                masses = hdf[f'{particle_type}/mass'][()]
+            else:
+                masses.append(hdf[f'{particle_type}/mass'][()][mask])
+    if n_with_type == 0:
+        raise ValueError(
+            f"No '{particle_type}' particles found in minibox {mini_box_id} or "
+            f"its neighbors in {box_dir}; check particle_type and load_path."
+        )
 
-    except Exception as e:
-        print(f'Particle type not valid. {e}')
+    # No rows in any file (same error as the original code, which raised it
+    # from relative_coordinates on the concatenated array).
+    if n_loaded == 0:
+        raise ValueError("Input positions must contain at least one particle")
 
     # Concatenate all loaded data into single arrays
     positions = numpy.concatenate(positions)
@@ -710,11 +786,6 @@ def load_particles(
     ids = numpy.concatenate(ids)
     if isinstance(masses, list):
         masses = numpy.concatenate(masses)
-
-    # Same error as before when the particle datasets are empty (previously
-    # raised by relative_coordinates on the concatenated array).
-    if n_loaded == 0:
-        raise ValueError("Input positions must contain at least one particle")
 
     return positions, velocities, ids, masses
 
@@ -801,8 +872,9 @@ def load_seeds(
         If load_path is not a directory.
     OSError
         If HDF5 files cannot be read or are corrupted.
-    RuntimeError
-        If loaded data is inconsistent or if no particles are found.
+    ValueError
+        If the mini-box and its  neighbors contain no rows at all. (If rows
+        exist but none lie within the padding, empty arrays are returned.)
 
     See Also
     --------
@@ -834,7 +906,7 @@ def load_seeds(
     label_m200, label_r200, label_rs = seed_prop_names
 
     # Get the adjacent mini-box IDs. With fewer than 3 cells per side the same
-    # neighbour appears several times; load each mini-box only once.
+    #  neighbor appears several times; load each mini-box only once.
     mini_box_ids = _unique_in_order(get_adjacent_mini_box_ids(
         mini_box_id=mini_box_id,
         boxsize=boxsize,
@@ -889,7 +961,8 @@ def load_seeds(
     # Final validation
     n_loaded = len(positions)
     if n_loaded == 0:
-        return (() for _ in range(7))
+        return (positions, velocities, ids, r200, m200, rs, mini_box_mask)
+
 
     # Sort seeds by M200 (largest first)
     argorder = numpy.argsort(-m200)
@@ -902,3 +975,78 @@ def load_seeds(
     mini_box_mask = mini_box_mask[argorder]
 
     return positions, velocities, ids, r200, m200, rs, mini_box_mask
+
+
+
+# Converting existing mini-box data to tiles ----------------------------------
+
+def _mini_box_files(load_path, boxsize, minisize):
+    """Paths of the mini-box files of a box, in mini-box ID order."""
+    n = int(numpy.ceil(boxsize / minisize))
+    folder = Path(load_path) / f'mini_boxes_nside_{n}'
+    if not folder.is_dir():
+        raise FileNotFoundError(f"no mini-box folder {folder}")
+    return [str(folder / f'{i}.hdf5') for i in range(n**3)
+            if (folder / f'{i}.hdf5').exists()]
+
+
+def _read_mini_box_group(task):
+    """One mini-box file's rows of one group as a chunk (module level, so
+    oasis.tiles.build_tiles can read files in worker processes)."""
+    path, group = task
+    with h5py.File(path, 'r') as f:
+        g = f[group]
+        n = g['pos'].shape[0]
+        # Per-row datasets only: a constant particle mass is stored as a
+        # scalar and is passed to build_tiles separately.
+        return {k: g[k][()] for k in g if g[k].shape[:1] == (n,)}
+
+
+def minibox_chunks(load_path: str, boxsize: float, minisize: float,
+                   particle_type: str):
+    """
+    Chunk factory over existing mini-box files, one file per chunk, to build
+    tiles from mini-box data (e.g. when the original snapshot is gone).
+
+    Parameters
+    ----------
+    load_path : str
+        Folder that holds mini_boxes_nside_<n>/ (n = ceil(boxsize / minisize)).
+    boxsize, minisize : float
+        Box and mini-box sizes the files were written with.
+    particle_type : str
+        Group to read: 'dm' for particles, 'seed' for seeds.
+
+    Returns
+    -------
+    oasis.tiles.ChunkTasks
+        For oasis.tiles.build_tiles; files are read in parallel with
+        build_tiles(..., n_workers > 1). For particles, pass the constant
+        particle mass separately (minibox_particle_mass).
+
+    Notes
+    -----
+    Tiles with tiles_per_side=1, buffer_width=0 and inner_cell_size=minisize
+    built from these chunks give the same catalogue as the mini-box files.
+    """
+    from oasis.tiles import ChunkTasks      # tiles does not import minibox
+    files = []
+    for path in _mini_box_files(load_path, boxsize, minisize):
+        with h5py.File(path, 'r') as f:
+            if particle_type in f:          # e.g. a mini-box without seeds
+                files.append(path)
+    if not files:
+        raise ValueError(f"no '{particle_type}' data in the mini-box files of {load_path}")
+    return ChunkTasks(_read_mini_box_group, [(p, particle_type) for p in files])
+
+
+def minibox_particle_mass(load_path: str, boxsize: float, minisize: float,
+                          particle_type: str = 'dm') -> float:
+    """Constant particle mass stored in a box's mini-box files (as float32,
+    the value OASIS used), or None if the mass is stored per particle."""
+    for path in _mini_box_files(load_path, boxsize, minisize):
+        with h5py.File(path, 'r') as f:
+            if particle_type in f and 'mass' in f[particle_type]:
+                mass = f[particle_type]['mass']
+                return float(mass[()]) if mass.shape == () else None
+    raise ValueError(f"no '{particle_type}/mass' in the mini-box files of {load_path}")

@@ -5,7 +5,7 @@ Covers:
 - AnsiColor dataclass
 - timer decorator
 - TimerContext context manager
-- get_min_unit_dtype function
+- get_min_uint_dtype function
 - ensure_dir_exists function
 
 Tests are structured in classes for clarity and maintainability.
@@ -107,7 +107,10 @@ class TestTimerContext:
 
         assert t.elapsed is not None
         captured = capsys.readouterr().out
-        assert "unit test completed in" in captured
+        # Start and end are printed on separate lines: "unit test..." then
+        # "\t completed in HH:MM:SS.mmm".
+        assert "unit test..." in captured
+        assert "completed in" in captured
 
     def test_context_with_fancy_output(self, capsys):
         """Ensure fancy output includes ANSI escape codes."""
@@ -127,29 +130,29 @@ class TestTimerContext:
 
 
 class TestUintDtype:
-    """Tests for get_min_unit_dtype."""
+    """Tests for get_min_uint_dtype."""
 
     def test_wrong_dtype(self):
         """Invalid inputs should raise TypeError."""
         with pytest.raises(TypeError):
-            common.get_min_unit_dtype(-1)
+            common.get_min_uint_dtype(-1)
 
         with pytest.raises(TypeError):
-            common.get_min_unit_dtype(1.0)
+            common.get_min_uint_dtype(1.0)
 
     def test_correct_dtype_boundaries(self):
         """Check boundary values for dtype selection."""
-        assert common.get_min_unit_dtype(255) == numpy.uint8
-        assert common.get_min_unit_dtype(256) == numpy.uint16
-        assert common.get_min_unit_dtype(65_535) == numpy.uint16
-        assert common.get_min_unit_dtype(65_536) == numpy.uint32
-        assert common.get_min_unit_dtype(4_294_967_295) == numpy.uint32
-        assert common.get_min_unit_dtype(4_294_967_296) == numpy.uint64
+        assert common.get_min_uint_dtype(255) == numpy.uint8
+        assert common.get_min_uint_dtype(256) == numpy.uint16
+        assert common.get_min_uint_dtype(65_535) == numpy.uint16
+        assert common.get_min_uint_dtype(65_536) == numpy.uint32
+        assert common.get_min_uint_dtype(4_294_967_295) == numpy.uint32
+        assert common.get_min_uint_dtype(4_294_967_296) == numpy.uint64
 
     def test_overflow(self):
         """Values too large for uint64 should raise OverflowError."""
         with pytest.raises(OverflowError):
-            common.get_min_unit_dtype(18_446_744_073_709_551_616)
+            common.get_min_uint_dtype(18_446_744_073_709_551_616)
 
 
 class TestEnsureDirExists:
@@ -197,14 +200,14 @@ class TestEnsureDirExists:
 
 
 class TestValidateInputsPositiveNumber:
-    """Test suite for _validate_inputs_positive_number function."""
+    """Test suite for _validate_positive_number_non_zero function."""
 
     def test_valid_inputs(self):
         """Test that valid inputs don't raise exceptions."""
         # Should not raise any exceptions
-        common._validate_inputs_positive_number_non_zero(1.0, "test_param")
-        common._validate_inputs_positive_number_non_zero(100, "test_param")
-        common._validate_inputs_positive_number_non_zero(
+        common._validate_positive_number_non_zero(1.0, "test_param")
+        common._validate_positive_number_non_zero(100, "test_param")
+        common._validate_positive_number_non_zero(
             0.0001, "test_param")  # Small positive
 
     @pytest.mark.parametrize(
@@ -220,7 +223,7 @@ class TestValidateInputsPositiveNumber:
     def test_type_errors(self, value, expected_error):
         """Test that invalid types raise TypeError."""
         with pytest.raises(expected_error, match="test_param must be numeric"):
-            common._validate_inputs_positive_number_non_zero(value, "test_param")
+            common._validate_positive_number_non_zero(value, "test_param")
 
     @pytest.mark.parametrize(
         "value, expected_error, error_message",
@@ -237,31 +240,31 @@ class TestValidateInputsPositiveNumber:
     def test_value_errors(self, value, expected_error, error_message):
         """Test that invalid values raise ValueError with correct messages."""
         with pytest.raises(expected_error, match=error_message):
-            common._validate_inputs_positive_number_non_zero(value, "test_param")
+            common._validate_positive_number_non_zero(value, "test_param")
 
     def test_edge_cases(self):
         """Test edge cases with very small or very large numbers."""
         # Very small positive number
-        common._validate_inputs_positive_number_non_zero(1e-10, "test_param")
+        common._validate_positive_number_non_zero(1e-10, "test_param")
 
         # Very large number
-        common._validate_inputs_positive_number_non_zero(1e10, "test_param")
+        common._validate_positive_number_non_zero(1e10, "test_param")
 
         # Float precision edge case
-        common._validate_inputs_positive_number_non_zero(1.0000001, "test_param")
+        common._validate_positive_number_non_zero(1.0000001, "test_param")
 
 
 class TestValidateInputsCoordinateArrays:
-    """Test suite for _validate_inputs_coordinate_arrays function."""
+    """Test suite for _validate_coordinate_array function."""
 
     def test_valid_inputs(self):
         """Test that valid inputs don't raise exceptions."""
         # Should not raise any exceptions
-        common._validate_inputs_coordinate_arrays(
+        common._validate_coordinate_array(
             numpy.zeros((100, 3)), "positions")
-        common._validate_inputs_coordinate_arrays(
+        common._validate_coordinate_array(
             numpy.random.rand(50, 3), "velocities")
-        common._validate_inputs_coordinate_arrays(
+        common._validate_coordinate_array(
             numpy.array([[1.0, 2.0, 3.0]]), "single_position")
 
     @pytest.mark.parametrize(
@@ -283,11 +286,11 @@ class TestValidateInputsCoordinateArrays:
     def test_invalid_inputs(self, array, expected_error, error_message):
         """Test that invalid inputs raise appropriate exceptions."""
         with pytest.raises(expected_error, match=error_message):
-            common._validate_inputs_coordinate_arrays(array, "test_array")
+            common._validate_coordinate_array(array, "test_array")
 
 
 class TestValidateInputsExistingPath:
-    """Test suite for _validate_inputs_existing_path function."""
+    """Test suite for _validate_existing_path function."""
 
     def test_valid_inputs(self, tmp_path):
         """Test that valid inputs don't raise exceptions."""
@@ -297,15 +300,15 @@ class TestValidateInputsExistingPath:
         valid_file.write_text("dummy")
 
         # Should not raise any exceptions
-        common._validate_inputs_existing_path(valid_dir)
-        common._validate_inputs_existing_path(str(valid_dir))
+        common._validate_existing_path(valid_dir)
+        common._validate_existing_path(str(valid_dir))
 
         # Should not raise exceptionss
         with pytest.raises(NotADirectoryError):
-            common._validate_inputs_existing_path(valid_file)
+            common._validate_existing_path(valid_file)
         
         with pytest.raises(NotADirectoryError):
-            common._validate_inputs_existing_path(str(valid_file))
+            common._validate_existing_path(str(valid_file))
 
     @pytest.mark.parametrize(
         "path, expected_error, error_message",
@@ -323,11 +326,11 @@ class TestValidateInputsExistingPath:
     def test_invalid_inputs(self, path, expected_error, error_message):
         """Test that invalid inputs raise appropriate exceptions."""
         with pytest.raises(expected_error, match=error_message):
-            common._validate_inputs_existing_path(path)
+            common._validate_existing_path(path)
 
 
 class TestValidateInputsBoxsizeMinisize:
-    """Test suite for _validate_inputs_boxsize_minisize function."""
+    """Test suite for _validate_boxsize_minisize function."""
 
     @pytest.mark.parametrize(
         "boxsize, minisize, expected_error, error_message",
@@ -355,32 +358,32 @@ class TestValidateInputsBoxsizeMinisize:
     def test_value_errors(self, boxsize, minisize, expected_error, error_message):
         """Test that invalid values raise ValueError with correct messages."""
         with pytest.raises(expected_error, match=error_message):
-            common._validate_inputs_boxsize_minisize(boxsize, minisize)
+            common._validate_boxsize_minisize(boxsize, minisize)
 
     def test_edge_cases(self):
         """Test edge cases with very small or very large numbers."""
         # Very small positive numbers
-        common._validate_inputs_boxsize_minisize(1e-10, 1e-11)
+        common._validate_boxsize_minisize(1e-10, 1e-11)
 
         # Very large numbers
-        common._validate_inputs_boxsize_minisize(1e10, 1e9)
+        common._validate_boxsize_minisize(1e10, 1e9)
 
         # Float precision edge cases
-        common._validate_inputs_boxsize_minisize(1.0000001, 1.0)
+        common._validate_boxsize_minisize(1.0000001, 1.0)
 
 
 class TestValidateInputsMiniBoxId:
-    """Test suite for _validate_inputs_mini_box_id function."""
+    """Test suite for _validate_mini_box_id function."""
 
     def test_valid_inputs(self):
         """Test that valid inputs don't raise exceptions."""
         # Should not raise any exceptions
-        common._validate_inputs_mini_box_id(0, cells_per_side=10)
-        common._validate_inputs_mini_box_id(999, cells_per_side=10)
+        common._validate_mini_box_id(0, cells_per_side=10)
+        common._validate_mini_box_id(999, cells_per_side=10)
 
         # Should not raise an exception
         with pytest.raises(ValueError, match="exceeds maximum valid ID"):
-            common._validate_inputs_mini_box_id(27, cells_per_side=3)
+            common._validate_mini_box_id(27, cells_per_side=3)
 
     @pytest.mark.parametrize(
         "mini_box_id, cells_per_side, expected_error, error_message",
@@ -414,7 +417,7 @@ class TestValidateInputsMiniBoxId:
                             expected_error, error_message):
         """Test that invalid inputs raise appropriate exceptions."""
         with pytest.raises(expected_error, match=error_message):
-            common._validate_inputs_mini_box_id(mini_box_id, cells_per_side)
+            common._validate_mini_box_id(mini_box_id, cells_per_side)
 
 
 class TestValidateInputsLoad:
@@ -520,326 +523,138 @@ class TestValidateInputsLoad:
         common._validate_inputs_load(0, 1e-3, 1e-4, valid_dir, 0.1)
 
 
-class TestValidateInputsBoxPartitioning:
-    """Test suite for _validate_inputs_box_partitioning function."""
+class TestValidateProcessObjects:
+    """Test suite for _validate_process_objects, which checks the extra
+    per-object properties ('data') passed to process_simulation_data.
+
+    It replaced _validate_inputs_box_partitioning. Positions, velocities and
+    IDs are now validated in process_simulation_data itself; those checks are
+    covered by TestSplitSimulationIntoMiniBoxes (test_minibox.py) and
+    TestValidateInputsCoordinateArrays.
+    """
+
+    N_PARTICLES = 100
 
     @pytest.fixture
-    def valid_data(self):
-        """Fixture providing valid test data."""
-        n_particles = 100
-        positions = numpy.random.rand(n_particles, 3)
-        velocities = numpy.random.rand(n_particles, 3)
-        uid = numpy.arange(n_particles)
-        return positions, velocities, uid, n_particles
-
-    @pytest.fixture
-    def valid_props(self, valid_data):
+    def valid_props(self):
         """Fixture providing valid props data."""
-        _, _, _, n_particles = valid_data
+        n = self.N_PARTICLES
         arrays = [
-            numpy.random.rand(n_particles),
-            numpy.random.rand(n_particles, 2),
-            numpy.ones(n_particles, dtype=int)
+            numpy.random.rand(n),
+            numpy.random.rand(n, 2),
+            numpy.ones(n, dtype=int)
         ]
         labels = ['property1', 'property2', 'property3']
         dtypes = [numpy.float32, numpy.float64, numpy.int32]
         return (arrays, labels, dtypes)
 
-    def test_valid_inputs_no_props(self, valid_data):
-        """Test that valid inputs without props don't raise exceptions."""
-        positions, velocities, uid, _ = valid_data
-        common._validate_inputs_box_partitioning(
-            positions, velocities, uid, None)
-
-    def test_valid_inputs_with_props(self, valid_data, valid_props):
-        """Test that valid inputs with props don't raise exceptions."""
-        positions, velocities, uid, _ = valid_data
-        common._validate_inputs_box_partitioning(
-            positions, velocities, uid, valid_props)
-
-    def test_empty_arrays(self):
-        """Test that empty but correctly shaped arrays are valid."""
-        positions = numpy.empty((1, 3))
-        velocities = numpy.empty((1, 3))
-        uid = numpy.empty(1)
-        common._validate_inputs_box_partitioning(
-            positions, velocities, uid, None)
+    def test_valid_inputs_with_props(self, valid_props):
+        """Test that valid props don't raise exceptions."""
+        common._validate_process_objects(valid_props, self.N_PARTICLES)
 
     @pytest.mark.parametrize(
-        "positions_shape, expected_error",
-        [
-            # Wrong number of dimensions
-            ((100,), "positions must have shape"),
-            ((100, 3, 2), "positions must have shape"),
-            # Wrong second dimension
-            ((100, 2), "positions must have shape"),
-            ((100, 4), "positions must have shape"),
-            ((100, 1), "positions must have shape"),
-        ],
-    )
-    def test_invalid_positions_shape(self, positions_shape, expected_error):
-        """Test that invalid positions shapes raise ValueError."""
-        positions = numpy.zeros(positions_shape)
-        velocities = numpy.zeros((100, 3))
-        uid = numpy.zeros(100)
-
-        with pytest.raises(ValueError, match=expected_error):
-            common._validate_inputs_box_partitioning(
-                positions, velocities, uid, None)
-
-    @pytest.mark.parametrize(
-        "velocities_shape, expected_error",
-        [
-            # Wrong number of dimensions
-            ((100,), "velocities must have shape"),
-            ((100, 3, 2), "velocities must have shape"),
-            # Wrong second dimension
-            ((100, 2), "velocities must have shape"),
-            ((100, 4), "velocities must have shape"),
-            ((100, 1), "velocities must have shape"),
-        ],
-    )
-    def test_invalid_velocities_shape(self, velocities_shape, expected_error):
-        """Test that invalid velocities shapes raise ValueError."""
-        positions = numpy.zeros((100, 3))
-        velocities = numpy.zeros(velocities_shape)
-        uid = numpy.zeros(100)
-
-        with pytest.raises(ValueError, match=expected_error):
-            common._validate_inputs_box_partitioning(
-                positions, velocities, uid, None)
-
-    @pytest.mark.parametrize(
-        "uid_shape, expected_error",
-        [
-            # Wrong number of dimensions
-            ((100, 1), "uid must be a 1D array"),
-            ((100, 3), "uid must be a 1D array"),
-            ((100, 2, 3), "uid must be a 1D array"),
-        ],
-    )
-    def test_invalid_uid_shape(self, uid_shape, expected_error):
-        """Test that invalid uid shapes raise ValueError."""
-        positions = numpy.zeros((100, 3))
-        velocities = numpy.zeros((100, 3))
-        uid = numpy.zeros(uid_shape)
-
-        with pytest.raises(ValueError, match=expected_error):
-            common._validate_inputs_box_partitioning(
-                positions, velocities, uid, None)
-
-    @pytest.mark.parametrize(
-        "pos_size, vel_size, uid_size",
-        [
-            (100, 50, 100),  # velocities mismatch
-            (100, 100, 50),  # uid mismatch
-            (50, 100, 100),  # positions mismatch
-            (100, 50, 75),   # all different
-            # (0, 10, 0),      # mixed empty/non-empty
-        ],
-    )
-    def test_mismatched_array_lengths(self, pos_size, vel_size, uid_size):
-        """Test that arrays with mismatched lengths raise ValueError."""
-        positions = numpy.zeros((pos_size, 3))
-        velocities = numpy.zeros((vel_size, 3))
-        uid = numpy.zeros(uid_size)
-
-        with pytest.raises(ValueError, match="positions, velocities, and uid must have the same length"):
-            common._validate_inputs_box_partitioning(
-                positions, velocities, uid, None)
-
-    @pytest.mark.parametrize(
-        "props_input, expected_error",
+        "props_input",
         [
             # Wrong type
-            ("invalid", "props must be a tuple of \\(arrays, labels, dtypes\\)"),
-            (["list", "instead", "of", "tuple"],
-             "props must be a tuple of \\(arrays, labels, dtypes\\)"),
-            (42, "props must be a tuple of \\(arrays, labels, dtypes\\)"),
+            "invalid",
+            ["list", "instead", "of", "tuple"],
+            42,
             # Wrong tuple length
-            ((), "props must be a tuple of \\(arrays, labels, dtypes\\)"),
-            (([], []), "props must be a tuple of \\(arrays, labels, dtypes\\)"),
-            (([], [], [], []), "props must be a tuple of \\(arrays, labels, dtypes\\)"),
+            (),
+            ([], []),
+            ([], [], [], []),
         ],
     )
-    def test_invalid_props_structure(self, valid_data, props_input, expected_error):
+    def test_invalid_props_structure(self, props_input):
         """Test that invalid props structure raises ValueError."""
-        positions, velocities, uid, _ = valid_data
-
-        with pytest.raises(ValueError, match=expected_error):
-            common._validate_inputs_box_partitioning(
-                positions, velocities, uid, props_input)
+        with pytest.raises(ValueError,
+                           match="data must be a tuple of \\(arrays, labels, dtypes\\)"):
+            common._validate_process_objects(props_input, self.N_PARTICLES)
 
     @pytest.mark.parametrize(
-        "arrays, labels, dtypes, expected_error",
+        "arrays, labels, dtypes",
         [
             # Wrong types in props tuple
-            ("not_list", [], [], "props must contain three lists"),
-            ([], "not_list", [], "props must contain three lists"),
-            ([], [], "not_list", "props must contain three lists"),
-            (42, [], [], "props must contain three lists"),
-            ([], [], 42, "props must contain three lists"),
+            ("not_list", [], []),
+            ([], "not_list", []),
+            ([], [], "not_list"),
+            (42, [], []),
+            ([], [], 42),
         ],
     )
-    def test_invalid_props_list_types(self, valid_data, arrays, labels, dtypes, expected_error):
+    def test_invalid_props_list_types(self, arrays, labels, dtypes):
         """Test that props with wrong list types raise ValueError."""
-        positions, velocities, uid, _ = valid_data
-        props = (arrays, labels, dtypes)
+        with pytest.raises(ValueError, match="data must contain only lists or tuples"):
+            common._validate_process_objects((arrays, labels, dtypes),
+                                             self.N_PARTICLES)
 
-        with pytest.raises(ValueError, match=expected_error):
-            common._validate_inputs_box_partitioning(
-                positions, velocities, uid, props)
-
-    def test_mismatched_props_lengths(self, valid_data):
-        """Test that props lists with different lengths raise ValueError."""
-        positions, velocities, uid, _ = valid_data
-
-        arrays = [numpy.zeros(100)]
-        labels = ['prop1', 'prop2']  # Different length
-        dtypes = [numpy.float32]
-        props = (arrays, labels, dtypes)
-
-        with pytest.raises(ValueError, match="All lists in props must have the same length"):
-            common._validate_inputs_box_partitioning(
-                positions, velocities, uid, props)
-
-    @pytest.mark.parametrize(
-        "array_type",
-        [
-            "not_array",
-            42,
-            [1, 2, 3],
-            None,
-        ],
-    )
-    def test_non_numpy_array_in_props(self, valid_data, array_type):
+    @pytest.mark.parametrize("array_type", ["not_array", 42, [1, 2, 3], None])
+    def test_non_numpy_array_in_props(self, array_type):
         """Test that non-numpy arrays in props raise ValueError."""
-        positions, velocities, uid, n_particles = valid_data
+        props = ([array_type], ['prop1'], [numpy.float32])
+        with pytest.raises(ValueError, match="array 0 in data\\[0\\] must be a numpy array"):
+            common._validate_process_objects(props, self.N_PARTICLES)
 
-        arrays = [array_type]
-        labels = ['prop1']
-        dtypes = [numpy.float32]
-        props = (arrays, labels, dtypes)
-
-        with pytest.raises(ValueError, match="props array 0 must be a numpy array"):
-            common._validate_inputs_box_partitioning(
-                positions, velocities, uid, props)
-
-    @pytest.mark.parametrize(
-        "wrong_size",
-        [50, 150, 0, 1]
-    )
-    def test_wrong_size_props_array(self, valid_data, wrong_size):
+    @pytest.mark.parametrize("wrong_size", [50, 150, 0, 1])
+    def test_wrong_size_props_array(self, wrong_size):
         """Test that props arrays with wrong size raise ValueError."""
-        positions, velocities, uid, n_particles = valid_data
+        props = ([numpy.zeros(wrong_size)], ['prop1'], [numpy.float32])
+        with pytest.raises(ValueError,
+                           match=f"array 0 in data\\[0\\] must have {self.N_PARTICLES} elements"):
+            common._validate_process_objects(props, self.N_PARTICLES)
 
-        arrays = [numpy.zeros(wrong_size)]
-        labels = ['prop1']
-        dtypes = [numpy.float32]
-        props = (arrays, labels, dtypes)
-
-        with pytest.raises(ValueError, match=f"props array 0 must have {n_particles} elements"):
-            common._validate_inputs_box_partitioning(
-                positions, velocities, uid, props)
-
-    def test_multiple_props_arrays_validation(self, valid_data):
+    def test_multiple_props_arrays_validation(self):
         """Test validation of multiple props arrays with mixed validity."""
-        positions, velocities, uid, n_particles = valid_data
-
-        # Second array has wrong size
+        n = self.N_PARTICLES
         arrays = [
-            numpy.zeros(n_particles),  # Correct
-            numpy.zeros(n_particles // 2),  # Wrong size
-            numpy.zeros(n_particles)   # Correct
+            numpy.zeros(n),       # Correct
+            numpy.zeros(n // 2),  # Wrong size
+            numpy.zeros(n)        # Correct
         ]
-        labels = ['prop1', 'prop2', 'prop3']
-        dtypes = [numpy.float32, numpy.float64, numpy.int32]
-        props = (arrays, labels, dtypes)
+        props = (arrays, ['prop1', 'prop2', 'prop3'],
+                 [numpy.float32, numpy.float64, numpy.int32])
+        with pytest.raises(ValueError, match=f"array 1 in data\\[0\\] must have {n} elements"):
+            common._validate_process_objects(props, n)
 
-        with pytest.raises(ValueError, match=f"props array 1 must have {n_particles} elements"):
-            common._validate_inputs_box_partitioning(
-                positions, velocities, uid, props)
-
-    def test_props_with_different_array_shapes(self, valid_data):
-        """Test that props arrays can have different shapes as long as first dimension matches."""
-        positions, velocities, uid, n_particles = valid_data
-
+    def test_props_with_different_array_shapes(self):
+        """Props arrays may have any shape as long as the first dimension matches."""
+        n = self.N_PARTICLES
         arrays = [
-            numpy.zeros(n_particles),          # 1D
-            numpy.zeros((n_particles, 3)),     # 2D
-            numpy.zeros((n_particles, 2, 4))   # 3D
+            numpy.zeros(n),          # 1D
+            numpy.zeros((n, 3)),     # 2D
+            numpy.zeros((n, 2, 4))   # 3D
         ]
-        labels = ['prop1', 'prop2', 'prop3']
-        dtypes = [numpy.float32, numpy.float64, numpy.int32]
-        props = (arrays, labels, dtypes)
+        props = (arrays, ['prop1', 'prop2', 'prop3'],
+                 [numpy.float32, numpy.float64, numpy.int32])
+        common._validate_process_objects(props, n)
 
-        # Should not raise an exception
-        common._validate_inputs_box_partitioning(
-            positions, velocities, uid, props)
-
-    def test_tuples_instead_of_lists_in_props(self, valid_data):
+    def test_tuples_instead_of_lists_in_props(self):
         """Test that tuples are accepted instead of lists in props."""
-        positions, velocities, uid, n_particles = valid_data
-
-        arrays = (numpy.zeros(n_particles),)  # tuple instead of list
-        labels = ('prop1',)                # tuple instead of list
-        dtypes = (numpy.float32,)            # tuple instead of list
-        props = (arrays, labels, dtypes)
-
-        # Should not raise an exception
-        common._validate_inputs_box_partitioning(
-            positions, velocities, uid, props)
-
-
-class TestValidationIntegration:
-    """Integration tests for both validation functions together."""
-
-    @pytest.mark.parametrize("n_particles", [1, 10, 1000])
-    def test_various_particle_counts(self, n_particles):
-        """Test both functions with various particle counts."""
-        # Test boxsize/minisize validation
-        common._validate_inputs_boxsize_minisize(100.0, 10.0)
-
-        # Test array validation
-        positions = numpy.random.rand(n_particles, 3)
-        velocities = numpy.random.rand(n_particles, 3)
-        uid = numpy.arange(n_particles)
-
-        common._validate_inputs_box_partitioning(
-            positions, velocities, uid, None)
+        n = self.N_PARTICLES
+        props = ((numpy.zeros(n),), ('prop1',), (numpy.float32,))
+        common._validate_process_objects(props, n)
 
     def test_realistic_simulation_data(self):
-        """Test with realistic simulation-like data."""
-        # Large simulation
+        """Test with realistic simulation-like extra properties."""
         n_particles = 10000
-        boxsize = 500.0
-        minisize = 25.0
-
-        # Validate box parameters
-        common._validate_inputs_boxsize_minisize(boxsize, minisize)
-
-        # Create realistic data
-        positions = numpy.random.uniform(0, boxsize, size=(n_particles, 3))
-        velocities = numpy.random.normal(0, 100, size=(n_particles, 3))
-        uid = numpy.arange(n_particles, dtype=numpy.int64)
-
-        # Additional properties
         masses = numpy.random.lognormal(0, 1, size=n_particles)
         temperatures = numpy.random.exponential(1000, size=n_particles)
-
         props = (
             [masses, temperatures],
             ['mass', 'temperature'],
             [numpy.float32, numpy.float32]
         )
+        common._validate_process_objects(props, n_particles)
 
-        # Should validate successfully
-        common._validate_inputs_box_partitioning(
-            positions, velocities, uid, props)
+    def test_mismatched_props_lengths(self):
+        """arrays, labels and dtypes must have the same length."""
+        props = ([numpy.zeros(self.N_PARTICLES)], ['prop1', 'prop2'], [numpy.float32])
+        with pytest.raises(ValueError, match="must have the same length"):
+            common._validate_process_objects(props, self.N_PARTICLES)
 
 
 class TestValidateInputsSeedData:
-    """Test suite for _validate_inputs_seed_data function."""
+    """Test suite for _validate_seed_data function."""
 
     @pytest.fixture
     def valid_seed_data(self):
@@ -862,16 +677,16 @@ class TestValidateInputsSeedData:
 
     def test_valid_inputs(self, valid_seed_data, valid_seed_data_single):
         """Test that valid inputs don't raise exceptions."""
-        common._validate_inputs_seed_data(valid_seed_data)
-        common._validate_inputs_seed_data(valid_seed_data_single)
+        common._validate_seed_data(valid_seed_data)
+        common._validate_seed_data(valid_seed_data_single)
 
     def test_wrong_length(self, valid_seed_data, valid_seed_data_single):
         """Test that the wrong number of elements raises excpetions"""
         with pytest.raises(ValueError, match='seed_data must be a tuple of 4 elements'):
-            common._validate_inputs_seed_data((*valid_seed_data, valid_seed_data[0]))
+            common._validate_seed_data((*valid_seed_data, valid_seed_data[0]))
         
         with pytest.raises(ValueError, match='seed_data must be a tuple of 4 elements'):
-            common._validate_inputs_seed_data((*valid_seed_data_single, valid_seed_data_single[0]))
+            common._validate_seed_data((*valid_seed_data_single, valid_seed_data_single[0]))
 
 
 ###

@@ -1,6 +1,37 @@
+"""Calibration of the phase-space cut that classifies particles as orbiting or infalling.
+
+Particles are classified in the plane of ln(v^2 / V200m^2) versus r / R200m (v is the physical
+velocity relative to the halo and r is the comoving distance), separately for positive and
+negative radial velocity. Each boundary is a line with a slope and a value at r / R200m = 0.5;
+for negative radial velocities the line becomes a quadratic below the pivot (the low-radius
+correction), reaching 2 at r = 0.
+
+Entry point: ``calibrate(save_path, omega_m=...)``. It writes calibration_pars.hdf5 with 
+'pos' = [slope, value at pivot], 'neg/line' = [slope, value at pivot] and 'neg/quad' = 
+[alpha, beta, gamma] (low radius quadratic).
+
+Two options:
+
+- Cosmology-based (``omega_m`` given): Omega_m(z) at the snapshot redshift sets the slope,
+    slope = -1.903 + 0.4348 * ln(Omega_m(z) / 0.5), a logarithmic fit to the self-calibrated slopes
+    of 100 Latin-hypercube Quijote boxes at z = 0 and 10 boxes each at z = 0.5, 1, 2, and 3. The 
+    pivot values are fixed (1.8085 for positive radial velocity and 0.6657 for negative radial 
+    velocity), the negative slope equals the positive one, and the low-radius correction follows
+    from them. Needs no particle data; used for large simulations.
+- Self-calibration (``omega_m`` = None, settings passed to ``self_calibration``):
+    uses the particles around the most massive isolated seeds (no neighbor above 20% of the seed's
+    mass within 2 * R200m). The positive-v_r slope is fitted to the low-density valley (gradient minima)
+    between 0.2 and 0.5 R200m, and its pivot is set so that 99.5% of positive-v_r particles lie below the
+    line. The negative-v_r line has the same slope; its pivot value maximizes the mean squared
+    perpendicular distance of the particles within a band of half-width w (scaled by 1 + z / 3)
+    around it. Reads the particles around the seeds from the mini-box files, or from tiles
+    (``tile_paths``; same calibration data, e.g. for a single tile covering the box).
+    Optional diagnostic plots are saved to save_path.
+"""
+
 import os
 from multiprocessing import Pool
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import h5py
 import numpy
@@ -17,8 +48,8 @@ from oasis.common import (G_GRAVITY, _validate_boxsize_minisize,
                           _validate_mini_box_id, _validate_positive_number,
                           _validate_positive_number_non_zero,
                           _validate_seed_data)
-from oasis.coordinates import (_periodic_displacement, relative_coordinates,
-                               velocity_components)
+from oasis.coordinates import _periodic_displacement, velocity_components
+from oasis.datasource import BufferedTileDataSource
 from oasis.minibox import get_mini_box_id, load_particles
 
 __all__ = [
@@ -34,6 +65,10 @@ SIZE_LABELS: int = 16
 COLOR_BLUE = '#6591b5'
 COLOR_GRAY = '#808080'
 COLOR_RED = '#db715b'
+
+# Padding (Mpc/h) of the particle loads around each mini-box (or tile cell)
+# that holds calibration seeds; the mini-box loader's default.
+CALIBRATION_PADDING: float = 5.0
 
 
 def _compute_r200m_and_v200m(
@@ -165,8 +200,9 @@ def _get_candidate_seed_particle_data(
     particle_type: str,
     mass_density: float,
     redshift: float,
+    tile_path: Optional[str] = None,
 ) -> numpy.ndarray:
-    """
+    r"""
     Extract and process particle data for all seeds within a single mini-box.
 
     This function loads particles from a specified mini-box and its neighbors, then
@@ -204,20 +240,24 @@ def _get_candidate_seed_particle_data(
     particle_type : str
         Particle type identifier within each HDF5 file. Valid names are 'dm', 
         'gas' and 'star'. Default is 'dm' for same-mass objects.
-    particle_mass : Union[float, numpy.ndarray]
-        Mass of each simulation particle. Must be positive.
     mass_density : float
         Mean matter density of the universe. Must be positive.
+    redshift : float
+        Redshift of the snapshot. Particle velocities are stored as
+        v_phys / sqrt(a) and are converted before use.
+    tile_path : str, optional
+        Tile file whose core holds this mini-box (cell); its particles are
+        read from the tile instead of the mini-box files. Default None.
 
     Returns
     -------
     numpy.ndarray
-        Particle data array with shape (n_particles, 3) where each row contains:
-        - Column 0: r/R200m - Radial distance scaled by R200m
-        - Column 1: vr/V200m - Radial velocity scaled by V200m  
-        - Column 2: ln(v^2/V200m^2) - Natural log of velocity squared scaled by V200m^2
+        Particle data array with shape (3, n_particles):
+        - Row 0: r/R200m - Radial distance scaled by R200m
+        - Row 1: vr/V200m - Radial velocity scaled by V200m  
+        - Row 2: ln(v^2/V200m^2) - Natural log of velocity squared scaled by V200m^2
 
-        If no valid particles are found, returns empty array with shape (0, 3).
+        If no valid particles are found, returns empty array with shape (3, 0).
 
     Raises
     ------
@@ -246,6 +286,9 @@ def _get_candidate_seed_particle_data(
     - Uses periodic boundary conditions when computing relative coordinates
     - R200m is defined as the radius where mean enclosed density equals 200*rhom
     - V200m = \sqrt(G*M200m/R200m) where M200m is the mass within R200m
+    - Particles are selected in a cube of half-side r_max around each seed,
+      using a periodic KD-tree built once per mini-box (same particles, same
+      order as masking all particles)
     - Memory usage scales with the number of particles within r_max of all seeds
 
     Examples
@@ -261,7 +304,7 @@ def _get_candidate_seed_particle_data(
     ...     boxsize=100.0,
     ...     minisize=10.0,
     ...     load_path="/data/miniboxes/",
-    ...     particle_mass=1e10,
+    ...     particle_type='dm',
     ...     mass_density=2.78e11
     ... )
     >>> print(f"Processed {data.shape[1]} particles from {len(pos_seeds)} seeds")
@@ -275,9 +318,18 @@ def _get_candidate_seed_particle_data(
     _validate_positive_number_non_zero(r_max, 'r_max')
     _validate_positive_number_non_zero(mass_density, 'rhom')
 
-    # Load particles in mini-box.
-    position_particles, velocity_particles, _, mass_particles = \
-        load_particles(mini_box_id, boxsize, minisize, load_path, particle_type)
+    # Load particles in the mini-box and its padding: from the mini-box files,
+    # or from the tile whose core holds this cell (cell IDs are mini-box IDs,
+    # and a tile cell loads exactly the particles of the same mini-box).
+    if tile_path is None:
+        position_particles, velocity_particles, _, mass_particles = load_particles(
+            mini_box_id, boxsize, minisize, load_path, particle_type,
+            padding=CALIBRATION_PADDING)
+    else:
+        particles = BufferedTileDataSource(
+            tile_path, padding=CALIBRATION_PADDING).load_particles(mini_box_id)
+        position_particles, velocity_particles, mass_particles = \
+            particles.pos, particles.vel, particles.mass
 
     # Periodic KD-tree over the particles, built once per mini-box. Candidates
     # are searched with a slightly larger radius, then the same cubic mask as
@@ -412,7 +464,7 @@ def _find_isolated_seeds(
 
     See Also
     --------
-    relative_coordinates : Computes relative positions with periodic boundaries
+    scipy.spatial.cKDTree : Periodic neighbor search used for the isolation test
     _select_candidate_seeds : Select isolated seeds and particles around them
     _get_candidate_seed_particle_data : Processes particles around seeds in one mini-box
 
@@ -422,7 +474,7 @@ def _find_isolated_seeds(
     - Searches seeds in input order, stopping when max_seeds are found
     - A seed with no neighbors within isolation radius is automatically isolated
     - Isolation radius scales with each seed's individual R200m value
-    - Memory usage is O(n_seeds^2) in worst case for distance calculations
+    - Memory usage is O(n_seeds) in worst case for distance calculations
 
     Examples
     --------
@@ -486,7 +538,7 @@ def _find_isolated_seeds(
         isolation_radius = isolation_radii[i]
         max_neighbor_mass = max_neighbor_masses[i]
 
-        # Use a KDTree to find neighbouring seeds.
+        # Use a KDTree to find neighboring seeds.
         idx_neighbor = position_tree.query_ball_point(current_position, 
                                                       isolation_radius,
                                                       p=numpy.inf,
@@ -559,7 +611,7 @@ def _group_seeds_by_minibox(
 
     Notes
     -----
-    - Minibox IDs are computed using spatial hashing of seed coordinates
+    - Mini-box IDs are computed using spatial hashing of seed coordinates
     - Empty mini-boxes (containing no seeds) are not included in the result
     - Seeds exactly on mini-box boundaries are assigned consistently
     - Memory usage scales linearly with the number of seeds
@@ -577,7 +629,7 @@ def _group_seeds_by_minibox(
     ... )
     >>> print(f"Seeds distributed across {len(groups)} mini-boxes")
     >>> for box_id, (pos, vel) in groups.items():
-    ...     print(f"Minibox {box_id}: {len(pos)} seeds")
+    ...     print(f"Mini-box {box_id}: {len(pos)} seeds")
     """
     # Validate inputs
     _validate_coordinate_array(position, 'position')
@@ -597,6 +649,48 @@ def _group_seeds_by_minibox(
     return minibox_groups
 
 
+def _tiles_by_cell(
+    tile_paths: Sequence[str],
+    boxsize: float,
+    minisize: float,
+) -> Dict[int, str]:
+    """
+    Map every cell (mini-box) ID to the tile whose core holds it.
+
+    Parameters
+    ----------
+    tile_paths : sequence of str
+        Tile files of one tiling of the box (see oasis.tiles.build_tiles).
+    boxsize, minisize : float
+        Box size and mini-box size; minisize must equal the tiles' inner cell
+        size, so cells and mini-boxes have the same IDs.
+
+    Returns
+    -------
+    dict
+        Cell ID -> tile path.
+
+    Raises
+    ------
+    ValueError
+        If a tile was built for another box size or cell size, if its ribbon
+        is narrower than CALIBRATION_PADDING (several tiles per side), or if
+        two tiles hold the same cell.
+    """
+    tile_of = {}
+    for path in tile_paths:
+        source = BufferedTileDataSource(path, padding=CALIBRATION_PADDING)
+        if source.boxsize != boxsize or source.cell_size != minisize:
+            raise ValueError(
+                f"{path} was built for boxsize {source.boxsize} and cell size "
+                f"{source.cell_size}, not boxsize {boxsize} and minisize {minisize}")
+        for region in source.region_ids():
+            if region in tile_of:
+                raise ValueError(f"cell {region} is in two tiles: {tile_of[region]}, {path}")
+            tile_of[region] = path
+    return tile_of
+
+
 def _select_candidate_seeds(
     n_seeds: int,
     seed_data: Tuple[numpy.ndarray],
@@ -610,12 +704,13 @@ def _select_candidate_seeds(
     isolation_factor: float = 0.2,
     isolation_radius_factor: float = 2.0,
     n_threads: Optional[int] = None,
+    tile_paths: Optional[Sequence[str]] = None,
 ) -> tuple[numpy.ndarray]:
     """
     Select isolated massive seeds and extract scaled particle data around them.
 
     This function identifies the most massive isolated seeds from the input
-    catalog and loads particles within r_max of each seed to compute r/R200m and 
+    catalogue and loads particles within r_max of each seed to compute r/R200m and 
     kinetic energy. Only seeds that dominate their local environment are 
     considered (isolation criterion: all neighbors within 2*R200m must have
     mass < 0.2*M200 of the seed).
@@ -653,10 +748,11 @@ def _select_candidate_seeds(
     particle_type : str
         Particle type identifier within each HDF5 file. Valid names are 'dm', 
         'gas' and 'star'. Default is 'dm' for same-mass objects.
-    particle_mass : float
-        Mass of each simulation particle. Must be positive.
     mass_density : float
         Mean matter density of the universe. Must be positive.
+    redshift : float
+        Redshift of the snapshot. Particle velocities are stored as
+        v_phys / sqrt(a) and are converted before use.
     isolation_factor : float, optional
         Maximum allowed mass ratio for isolation criterion. Neighbors must have
         mass < isolation_factor * seed_mass to satisfy isolation criterion.
@@ -667,6 +763,13 @@ def _select_candidate_seeds(
     n_threads : int, optional
         Number of threads for parallel processing. If None, uses half of
         available CPU cores, capped by the number of mini-boxes to process.
+    tile_paths : sequence of str, optional
+        Tile files of the whole box (oasis.tiles.build_tiles), to read the
+        particles around the seeds from tiles instead of mini-box files. The
+        tiles' inner cell size must equal minisize, and with several tiles per
+        side their ribbon must be at least CALIBRATION_PADDING (5 Mpc/h). Gives
+        the same calibration data as the mini-box files (rows may be in a
+        different order). Default None: mini-box files.
 
     Returns
     -------
@@ -724,7 +827,7 @@ def _select_candidate_seeds(
     ...     boxsize=100.0,
     ...     minisize=10.0, 
     ...     save_path="/data/mini-boxes/",
-    ...     particle_mass=1e10,
+    ...     particle_type='dm',
     ...     mass_density=2.78e11,
     ...     n_threads=8
     ... )
@@ -766,6 +869,16 @@ def _select_candidate_seeds(
     minibox_groups = _group_seeds_by_minibox(
         position, velocity, boxsize, minisize)
 
+    # With tiles, each mini-box's particles are read from the tile holding it.
+    if tile_paths is not None:
+        tile_of = _tiles_by_cell(tile_paths, boxsize, minisize)
+        missing = sorted(set(minibox_groups) - set(tile_of))
+        if missing:
+            raise ValueError(f"no tile holds cells {missing[:10]}: pass the tiles "
+                             "of the whole box")
+    else:
+        tile_of = {}
+
     # Cap the number of threads to the total number of mini-boxes to process
     n_miniboxes = len(minibox_groups)
     if n_threads is None:
@@ -777,7 +890,7 @@ def _select_candidate_seeds(
     # Set up multiprocessing
     processing_args = [
         (minibox_id, position_group, velocity_group, r_max, boxsize, minisize,
-         load_path, particle_type, mass_density, redshift)
+         load_path, particle_type, mass_density, redshift, tile_of.get(minibox_id))
         for minibox_id, (position_group, velocity_group) in minibox_groups.items()
     ]
 
@@ -797,6 +910,9 @@ def _select_candidate_seeds(
         except Exception as e:
             print(
                 f"Warning: Parallel processing failed ({e}), falling back to sequential")
+            # Discard anything in the pool returned before failing, so the
+            # sequential pass below does not add those mini-boxes a second time.
+            results = []
             # Fall back to sequential processing
             n_threads = 1
 
@@ -921,7 +1037,7 @@ def _diagnostic_calibration_data_plot(
 
     for ax in axes:
         ax.set_xlabel(r'$r/R_{\rm 200m}$', fontsize=SIZE_LABELS)
-        ax.set_ylabel(r'$\ln(a^2v^2/v_{\rm 200m}^2)$', fontsize=SIZE_LABELS)
+        ax.set_ylabel(r'$\ln(v^2/v_{\rm 200m}^2)$', fontsize=SIZE_LABELS)
         ax.set_xlim(*limits[0])
         ax.set_ylim(*limits[1])
         ax.tick_params(axis="both", which="major", labelsize=SIZE_TICKS)
@@ -966,6 +1082,7 @@ def get_calibration_data(
     n_threads: Optional[int] = None,
     diagnostics: bool = True,
     overwrite: bool = False,
+    tile_paths: Optional[Sequence[str]] = None,
 ) -> Tuple[numpy.ndarray]:
     """
     Generate or load calibration data from isolated massive seed halos.
@@ -1003,8 +1120,6 @@ def get_calibration_data(
     particle_type : str
         Particle type identifier within each HDF5 file. Valid names are 'seed', 
         'dm', 'gas' and 'star'.
-    particle_mass : float
-        Mass of each simulation particle. Must be positive.
     mass_density : float
         Mean matter density of the universe. Must be positive.
     redshift : float
@@ -1026,6 +1141,13 @@ def get_calibration_data(
         Default is True.
     overwrite : bool, optional
         Whether to overwrite the existing calibration data. Default is False.
+    tile_paths : sequence of str, optional
+        Tile files of the whole box (oasis.tiles.build_tiles), to read the
+        particles around the seeds from tiles instead of mini-box files. The
+        tiles' inner cell size must equal minisize, and with several tiles per
+        side their ribbon must be at least CALIBRATION_PADDING (5 Mpc/h). Gives
+        the same calibration data as the mini-box files (rows may be in a
+        different order). Default None: mini-box files.
 
     Returns
     -------
@@ -1084,7 +1206,7 @@ def get_calibration_data(
     ...     boxsize=100.0,
     ...     minisize=10.0,
     ...     save_path="/data/calibration/",
-    ...     particle_mass=1e10,
+    ...     particle_type='dm',
     ...     mass_density=2.78e11,
     ...     redshift=0,
     ...     n_threads=16,
@@ -1101,7 +1223,7 @@ def get_calibration_data(
     ...     boxsize=100.0,
     ...     minisize=10.0,
     ...     save_path="/data/calibration/",  # Must contain calibration_data.hdf5
-    ...     particle_mass=1e10,
+    ...     particle_type='dm',
     ...     mass_density=2.78e11,
     ...     redshift=0,
     ...     diagnostics=False  # Skip plot generation
@@ -1136,6 +1258,7 @@ def get_calibration_data(
             isolation_factor=isolation_factor,
             isolation_radius_factor=isolation_radius_factor,
             n_threads=n_threads,
+            tile_paths=tile_paths,
         )
 
         radius = results[:, 0]
@@ -1255,7 +1378,7 @@ def _cost_percentile(abscissa: float, *data) -> float:
 
 
 def _cost_perpendicular_distance_abscissa(abscissa: float, *data) -> float:
-    """
+    r"""
     Compute cost for fitting line abscissa to maximize perpendicular distances.
 
     This cost function optimizes the y-intercept (at a pivot radius) of a line
@@ -1302,7 +1425,6 @@ def _cost_perpendicular_distance_abscissa(abscissa: float, *data) -> float:
     See Also
     --------
     scipy.optimize.minimize : Optimization routine for this cost function
-    _cost_perpendicular_distance_slope : Optimize slope with fixed intercept
     _cost_percentile : Alternative cost based on percentiles
 
     Notes
@@ -1362,7 +1484,7 @@ def _diagnostic_gradient_minima_plot(
     counts_gradient_minima: numpy.ndarray,
     diagnostics_title: str,
 ) -> None:
-    """
+    r"""
     Generate diagnostic plots for ln(v^2) gradient minimum in radial bins.
 
     This function creates an (n, m)-panel plot showing the distribution of 
@@ -1492,7 +1614,7 @@ def _gradient_minima(
     diagnostics: bool = True,
     diagnostics_title: Optional[str] = None,
 ) -> Tuple[numpy.ndarray]:
-    """
+    r"""
     Find gradient minima in KE-radius phase space to identify boundaries.
 
     This function find the minimum of the ln(v^2/V200m^2) distribution as a 
@@ -1789,7 +1911,7 @@ def _hist2d_mesh(
     n_bins: int,
     gradient: bool = False,
 ) -> Tuple[numpy.ndarray]:
-    """
+    r"""
     Compute 2D histogram with optional gradient for phase space analysis.
 
     This function creates a 2D histogram of (x, y) data and optionally computes
@@ -2172,7 +2294,7 @@ def _diagnostic_self_calibration_plot(
 
     for ax in axes:
         ax.set_xlabel(r'$r/R_{\rm 200m}$', fontsize=SIZE_LABELS)
-        ax.set_ylabel(r'$\ln(a^2v^2/v_{\rm 200m}^2)$', fontsize=SIZE_LABELS)
+        ax.set_ylabel(r'$\ln(v^2/v_{\rm 200m}^2)$', fontsize=SIZE_LABELS)
         ax.set_xlim(*limits[0])
         ax.set_ylim(*limits[1])
         ax.tick_params(axis="both", which="major", labelsize=SIZE_TICKS)
@@ -2290,6 +2412,7 @@ def self_calibration(
     n_threads: Optional[int] = None,
     diagnostics: bool = True,
     overwrite: bool = False,
+    tile_paths: Optional[Sequence[str]] = None,
 ) -> None:
     """
     Runs calibration from isolated halo samples.
@@ -2332,8 +2455,9 @@ def self_calibration(
         Directory path for reading mini-box data and writing calibration results.
         Must be a valid directory path with read/write permissions.
         Calibration parameters saved as 'calibration_pars.hdf5'.
-    particle_mass : float
-        Mass of each simulation particle. Must be positive.
+    particle_type : str
+        Particle type identifier within each HDF5 file. Valid names are
+        'seed', 'dm', 'gas', and 'star'.
     mass_density : float
         Mean matter density of the universe. Must be positive.
     redshift : float
@@ -2356,7 +2480,7 @@ def self_calibration(
         in units of ln(v^2/V200m^2). Must be positive. Default is 0.05. This is 
         scaled by (1 + z/3) to handle increased numerical noise. Smaller values 
         fit tighter to the data but may be noisier.
-    radius_pivot : floar, optional
+    radius_pivot : float, optional
         Pivot radius that marks the transition to the low radius correction. 
         Default is 0.5
     isolation_factor : float, optional
@@ -2375,7 +2499,14 @@ def self_calibration(
         Default is True. Plots saved to save_path.
     overwrite : bool, optional
         Whether to overwrite the existing calibration data. Default is False.
- 
+    tile_paths : sequence of str, optional
+        Tile files of the whole box (oasis.tiles.build_tiles), to read the
+        particles around the seeds from tiles instead of mini-box files. The
+        tiles' inner cell size must equal minisize, and with several tiles per
+        side their ribbon must be at least CALIBRATION_PADDING (5 Mpc/h). Gives
+        the same calibration data as the mini-box files (rows may be in a
+        different order). Default None: mini-box files.
+
     Returns
     -------
     None
@@ -2445,7 +2576,7 @@ def self_calibration(
     --------
     >>> import numpy as np
     >>> 
-    >>> # Prepare seed catalog from halo finder
+    >>> # Prepare seed catalogue from halo finder
     >>> positions = np.random.uniform(0, 100, (1000, 3))
     >>> velocities = np.random.normal(0, 200, (1000, 3))
     >>> masses = np.random.lognormal(30, 1, 1000)
@@ -2460,7 +2591,7 @@ def self_calibration(
     ...     boxsize=100.0,
     ...     minisize=10.0,
     ...     save_path="/data/calibration/",
-    ...     particle_mass=1e10,
+    ...     particle_types='dm',
     ...     mass_density=2.78e11,
     ...     redshift=0.0,
     ...     percent=0.995,
@@ -2484,7 +2615,7 @@ def self_calibration(
     ...     boxsize=200.0,
     ...     minisize=10.0,
     ...     save_path="/data/calibration_z2/",
-    ...     particle_mass=1e10,
+    ...     particle_type='dm',
     ...     mass_density=2.78e11,
     ...     redshift=2.0,  # Higher redshift
     ...     width=0.05,     # Will be scaled to 0.05 * (1 + 2/3) ≈ 0.083
@@ -2507,6 +2638,7 @@ def self_calibration(
         isolation_radius_factor=isolation_radius_factor,
         diagnostics=diagnostics,
         overwrite=overwrite,
+        tile_paths=tile_paths,
     )
 
     mask_negative_vr = (radial_velocity < 0)
@@ -2534,7 +2666,7 @@ def self_calibration(
 
     # Mask outliers
     abs_dev = numpy.abs(gradient_minumum_positive - numpy.median(gradient_minumum_positive))
-    median_abs_dev = 1.4286 * numpy.median(abs_dev)
+    median_abs_dev = 1.4826 * numpy.median(abs_dev)
     mask_outliers = abs_dev <= 3. * median_abs_dev
     
     # Find slope by fitting to the minima.
@@ -2574,7 +2706,7 @@ def self_calibration(
 
     # Mask outliers
     abs_dev = numpy.abs(gradient_minumum_negative - numpy.median(gradient_minumum_negative))
-    median_abs_dev = 1.4286 * numpy.median(abs_dev)
+    median_abs_dev = 1.4826 * numpy.median(abs_dev)
     mask_outliers = abs_dev <= 3. * median_abs_dev
 
     # Find abscissa initial guess by fitting to the minima.
@@ -2654,7 +2786,7 @@ def calibrate(
     omega_m: Optional[float] = None,
     **kwargs,
 ) -> None:
-    """
+    r"""
     Calibrate halo finder parameters using cosmology-based or simulation-based 
     approach.
 
@@ -2685,7 +2817,7 @@ def calibrate(
     omega_m : float, optional
         Matter density parameter at redshift z, \Omega_m(z) for cosmology-based 
         calibration. If provided, uses empirical scaling relations. Must be 
-        positive. Standard Lambda-CDM values:
+        positive. Standard Lambda-CDM values at z = 0:
         - Planck 2018: \Omega_m ≈ 0.315
         - WMAP: \Omega_m ≈ 0.27
         If None (default), performs full self-calibration from simulation data.
@@ -2694,13 +2826,15 @@ def calibrate(
         Ignored when using cosmology-based calibration. Required parameters for
         self-calibration include:
         - n_seeds : int - Number of halos for calibration
-        - seed_data : tuple - Halo catalog data
+        - seed_data : tuple - Halo catalogue data
         - r_max : float - Maximum radius for particle selection
         - boxsize : float - Simulation box size
-        - minisize : float - Minibox size
-        - particle_mass : float - Particle mass
+        - minisize : float - Mini-box size
+        - particle_type : str - Particle type
         - mass_density : float - Mean matter density
         - redshift : float - Simulation redshift
+        Optional: tile_paths (read the particles from tiles instead of
+        mini-box files).
         See self_calibration docstring for complete parameter descriptions.
 
     Returns
@@ -2730,12 +2864,12 @@ def calibrate(
     Uses empirical fitting formulas calibrated from a suite of simulations:
     
     - Positive radial velocity boundary:
-      * slope = -2.1203 + 0.7614 * (\Omega_m(z) - 0.3)
-      * abscissa = 1.8087 (fixed)
+      * slope = -1.9030 + 0.4348 * ln(\Omega_m(z) / 0.5)
+      * abscissa = 1.8085 (fixed)
       
     - Negative radial velocity boundary (at r_pivot = 0.5):
-      * slope = -1.5812 + 0.8603 * (\Omega_m(z) - 0.3)
-      * abscissa = 0.6204 (fixed)
+      * slope = -1.9030 + 0.4348 * ln(\Omega_m(z) / 0.5)
+      * abscissa = 0.6657 (fixed)
       * Quadratic correction computed to match boundary at r=0.5
       
     These relations are valid for Lambda-CDM cosmologies and were calibrated at 
@@ -2772,12 +2906,12 @@ def calibrate(
     >>> with h5py.File("/data/calibration/calibration_pars.hdf5", 'r') as f:
     ...     slope_pos, b_pos = f['pos'][()]
     ...     print(f"Positive vr: slope={slope_pos:.3f}, intercept={b_pos:.3f}")
-    Positive vr: slope=-1.915, intercept=1.664
+    Positive vr: slope=-2.125, intercept=1.809
 
     >>> # Example 2: Self-calibration from simulation data
     >>> import numpy as np
     >>> 
-    >>> # Prepare halo catalog
+    >>> # Prepare halo catalogue
     >>> positions = np.random.uniform(0, 100, (1000, 3))
     >>> velocities = np.random.normal(0, 200, (1000, 3))
     >>> masses = np.random.lognormal(30, 1, 1000)
@@ -2792,7 +2926,7 @@ def calibrate(
     ...     r_max=4.0,
     ...     boxsize=100.0,
     ...     minisize=10.0,
-    ...     particle_mass=1e10,
+    ...     particle_type='dm',
     ...     mass_density=2.78e11,
     ...     redshift=0.0,
     ...     diagnostics=True
@@ -2813,22 +2947,18 @@ def calibrate(
     ...     r_max=4.0,
     ...     boxsize=200.0,
     ...     minisize=10.0,
-    ...     particle_mass=1e10,
+    ...     particle_type='dm',
     ...     mass_density=2.78e11,
     ...     redshift=2.0,  # High redshift
     ...     n_threads=16,
     ...     diagnostics=True
     ... )
     """
-    if omega_m:
+    if omega_m is not None:
         if omega_m <=0 or omega_m > 1:
             raise ValueError("Omega_m out of bounds.")
         
         # Positive radial velocity
-        # slope_pos = -2.17603504 + 1.03114681 * (omega_m - 0.3)
-        # b_pivot_pos = 1.83532578
-
-        # slope_pos = -2.174666 + 1.435353 * (omega_m - 0.3)
         slope_pos = -1.9029634573662748 + 0.4347721236533314 * numpy.log(omega_m / 0.5)
         b_pivot_pos = 1.808536
 

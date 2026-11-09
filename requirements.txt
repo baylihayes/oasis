@@ -1,8 +1,7 @@
-setuptools
 numpy
 pandas
 scipy
 h5py
 tqdm
-pytest
 matplotlib
+hdf5plugin
