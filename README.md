@@ -1,7 +1,7 @@
 ![](res/oasis.jpg "title")
 # Orbiting Mass Assignment Scheme
 
-When using this code please cite Hayes et al. (2026) ([arXiv:XXXX.XXXX]()).
+When using this code please cite Hayes et al. (2026) ([arXiv:2611.13542]()).
 
 <span style="font-variant:small-caps;">Oasis</span> was created by Edgar Salazar ([edgarmsalazar/oasis](https://github.com/edgarmsalazar/oasis)) and is maintained by Bayli Hayes ([baylihayes/oasis](https://github.com/baylihayes/oasis)).
 
@@ -105,7 +105,7 @@ Before finding haloes, <span style="font-variant:small-caps;">Oasis</span> needs
 
 There are two options for calibrating the algorithm.
 
-1. Assume cosmological dependence. The slope of both cut lines depends on $\Omega_m(z)$, the matter density parameter at the snapshot's redshift, as $$m = -1.903 + 0.4348\,\ln\left(\Omega_m(z)/0.5\right),$$ a fit to the self-calibrated slopes of the [Quijote](https://quijote-simulations.readthedocs.io/en/latest/) latin hypercube sample. The values of the lines at $r/R_{\rm 200m}=0.5$ are fixed to the values found in Hayes et al. (2026) ([arXiv:XXXX.XXXX]()).
+1. Assume cosmological dependence. The slope of both cut lines depends on $\Omega_m(z)$, the matter density parameter at the snapshot's redshift, as $$m = -1.903 + 0.4348\,\ln\left(\Omega_m(z)/0.5\right),$$ a fit to the self-calibrated slopes of the [Quijote](https://quijote-simulations.readthedocs.io/en/latest/) latin hypercube sample. The values of the lines at $r/R_{\rm 200m}=0.5$ are fixed to the values found in Hayes et al. (2026) ([arXiv:2611.13542]()).
 
     > **RESULTS MAY VARY**. While this choice reduces noise in mass function measurements across different cosmologies, it is recommended to do a sanity check against calibration directly on the data.
 
